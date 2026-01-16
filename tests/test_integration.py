@@ -1,0 +1,277 @@
+"""Integration tests for BWW CLI and command execution."""
+
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+
+# Find project root (directory containing pyproject.toml)
+def _get_project_root() -> Path:
+    """Get the project root directory."""
+    current = Path(__file__).parent.parent
+    while current != current.parent:
+        if (current / 'pyproject.toml').exists():
+            return current
+        current = current.parent
+    raise RuntimeError('Could not find project root')
+
+
+PROJECT_ROOT = _get_project_root()
+
+
+def _strip_ansi(s: str) -> str:
+    """Remove ANSI escape sequences for robust assertions."""
+    import re
+
+    return re.sub(r'\x1b\[[0-9;]*m', '', s)
+
+
+def run_bww(*args: str) -> tuple[int, str, str]:
+    """Run bww command and return (exit_code, stdout, stderr)."""
+    import os
+
+    # Build command: run bww via Python module directly
+    cmd = [sys.executable, '-m', 'bww'] + list(args)
+
+    # Create temp directory for config to avoid interfering with user's ~/.config
+    with tempfile.TemporaryDirectory() as tmpdir:
+        env = os.environ.copy()
+        env['XDG_CONFIG_HOME'] = tmpdir
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            cwd=PROJECT_ROOT,
+            env=env,
+        )
+    return result.returncode, result.stdout, result.stderr
+
+
+def run_bww_with_env(env_overrides: dict[str, str], *args: str) -> tuple[int, str, str]:
+    """Run bww with environment overrides and return (exit_code, stdout, stderr)."""
+    import os
+
+    cmd = [sys.executable, '-m', 'bww'] + list(args)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        env = os.environ.copy()
+        env['XDG_CONFIG_HOME'] = tmpdir
+        env.update(env_overrides)
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            cwd=PROJECT_ROOT,
+            env=env,
+        )
+    return result.returncode, result.stdout, result.stderr
+
+
+class TestCLIParsing:
+    """Test CLI parsing and argument handling."""
+
+    def test_help(self) -> None:
+        """Test --help works."""
+        code, stdout, stderr = run_bww('--help')
+        assert code == 0
+        assert 'BubbleWrap Wrapper' in stdout
+        assert '--config' in stdout
+        assert '--profile' in stdout
+        assert '--share-net' in stdout
+        assert '--share-user' in stdout
+        assert '--share-ipc' in stdout
+        assert '--share-pid' in stdout
+        assert '--share-uts' in stdout
+        assert '--dev-bind' in stdout
+
+    def test_no_command_error(self) -> None:
+        """Test error when no command provided."""
+        code, stdout, stderr = run_bww()
+        assert code == 1
+        assert '[ERROR]' in stderr
+        assert 'command' in stderr.lower()
+
+    def test_dry_run_shows_command(self) -> None:
+        """Test --dry-run shows what would be executed."""
+        import shutil
+
+        code, stdout, stderr = run_bww('--dry-run', 'echo', 'hello')
+        assert code == 0
+        assert '[CMD]' in stdout
+        clean = _strip_ansi(stdout)
+        assert 'bwrap' in clean
+        assert '--chdir' in clean
+        assert str(PROJECT_ROOT) in clean
+        # Executed binary is auto-mounted read-only.
+        resolved_echo = shutil.which('echo')
+        if resolved_echo:
+            assert f'--ro-bind {resolved_echo} {resolved_echo}' in clean
+        assert '--argv0 echo' in clean
+        assert 'echo' in clean
+
+    def test_exe_ro_bind_skipped_when_dir_already_mounted(self) -> None:
+        """Test we don't add --ro-bind EXE EXE if a parent dir is already mounted."""
+        import shutil
+
+        resolved = shutil.which('echo')
+        if not resolved:
+            pytest.skip('echo not found in PATH')
+
+        kdl_cfg = f"""
+profiles.p {{
+  ro "{Path(resolved).parent}"
+}}
+"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = Path(tmpdir) / 'config.kdl'
+            cfg.write_text(kdl_cfg)
+            code, stdout, stderr = run_bww('--config', str(cfg), '-p', 'profiles.p', '--dry-run', 'echo', 'hi')
+            assert code == 0
+            clean = _strip_ansi(stdout)
+            assert f'--ro-bind {resolved} {resolved}' not in clean
+
+    def test_share_net_flag(self) -> None:
+        """Test --share-net omits --unshare-net."""
+        from pathlib import Path
+
+        code, stdout, stderr = run_bww('--share-net', '--dry-run', 'echo', 'hello')
+        assert code == 0
+        clean = _strip_ansi(stdout)
+        assert 'bwrap ' in clean
+        assert '--unshare-net' not in clean
+        # share-net implies we include common resolver-related files when present.
+        if Path('/etc/hosts').exists():
+            assert '--ro-bind /etc/hosts /etc/hosts' in clean
+        if Path('/etc/resolv.conf').exists():
+            assert '--ro-bind /etc/resolv.conf /etc/resolv.conf' in clean
+        if Path('/etc/nsswitch.conf').exists():
+            assert '--ro-bind /etc/nsswitch.conf /etc/nsswitch.conf' in clean
+
+    def test_dev_bind_flag(self) -> None:
+        """Test --dev-bind uses --dev-bind /dev /dev instead of --dev /dev."""
+        code, stdout, stderr = run_bww('--dev-bind', '--dry-run', 'echo', 'hello')
+        assert code == 0
+        assert '--dev-bind /dev /dev' in stdout
+        assert '--dev /dev' not in stdout
+
+    def test_reuse_session_flag(self) -> None:
+        """Test --reuse-session removes --new-session."""
+        code, stdout, stderr = run_bww('--reuse-session', '--dry-run', 'echo', 'hello')
+        assert code == 0
+        clean = _strip_ansi(stdout)
+        assert '--new-session' not in clean
+
+    def test_share_uts_flag(self) -> None:
+        """Test --share-uts omits --unshare-uts."""
+        code, stdout, stderr = run_bww('--share-uts', '--dry-run', 'echo', 'hello')
+        assert code == 0
+        clean = _strip_ansi(stdout)
+        assert '--unshare-uts' not in clean
+
+    def test_profile_flag_accepts_defaults_namespace(self) -> None:
+        """Test -p defaults.NAME uses a defaults profile."""
+        from pathlib import Path
+
+        code, stdout, stderr = run_bww('--config', 'example/config.kdl', '-p', 'defaults.firefox', '--dry-run', 'echo')
+        assert code == 0
+        clean = _strip_ansi(stdout)
+        # defaults.firefox inherits desktop, which enables device access.
+        assert '--dev-bind /dev /dev' in clean
+        home = str(Path.home())
+        assert f'--bind {home}/.mozilla {home}/.mozilla' in clean
+
+    def test_debug_flag(self) -> None:
+        """Test --debug shows command before execution."""
+        code, stdout, stderr = run_bww('--debug', '--dry-run', 'true')
+        assert code == 0
+        assert '[CMD]' in stdout
+
+    def test_cli_mount_rw(self) -> None:
+        """Test --rw CLI argument."""
+        code, stdout, stderr = run_bww('--rw', '/home', '--dry-run', 'echo', 'test')
+        assert code == 0
+        assert '--bind' in stdout
+        assert '/home' in stdout
+
+    def test_cli_mount_rw_relative_is_normalized(self) -> None:
+        """Test mount paths are expanded to absolute for bwrap."""
+        code, stdout, stderr = run_bww('--rw', '.', '--dry-run', 'echo', 'test')
+        assert code == 0
+        assert str(PROJECT_ROOT) in stdout
+        # Ensure tmpfs comes before bind mounts (requested ordering).
+        assert stdout.index('--tmpfs') < stdout.index('--bind')
+
+    def test_exec_path_is_expanded_when_pathlike(self) -> None:
+        """Test exec path expansion."""
+        code, stdout, stderr = run_bww('--dry-run', './README.md')
+        assert code == 0
+        assert str(PROJECT_ROOT / 'README.md') in stdout
+
+    def test_exec_is_resolved_via_path(self) -> None:
+        """Test bare executable names are resolved via PATH before building bwrap argv."""
+        import os
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            exe = Path(tmpdir) / 'fakecmd'
+            exe.write_text('#!/bin/sh\nexit 0\n')
+            exe.chmod(0o755)
+
+            env = {'PATH': f'{tmpdir}{os.pathsep}{os.environ.get("PATH", "")}'}
+            code, stdout, stderr = run_bww_with_env(env, '--dry-run', 'fakecmd')
+            assert code == 0
+            assert str(exe) in stdout
+
+    def test_cli_mount_ro(self) -> None:
+        """Test --ro CLI argument."""
+        code, stdout, stderr = run_bww('--ro', '/etc', '--dry-run', 'echo', 'test')
+        assert code == 0
+        assert '--ro-bind' in stdout
+        assert '/etc' in stdout
+
+    def test_cli_mount_tmpfs(self) -> None:
+        """Test --tmpfs CLI argument."""
+        code, stdout, stderr = run_bww('--tmpfs', '/tmp', '--dry-run', 'echo', 'test')
+        assert code == 0
+        assert '--tmpfs' in stdout
+
+    def test_cli_bwargs(self) -> None:
+        """Test --bwargs for extra arguments."""
+        code, stdout, stderr = run_bww('--bwargs', '--keep-fd 3:4', '--dry-run', 'echo', 'test')
+        assert code == 0
+        assert '--keep-fd' in stdout
+        assert '3:4' in stdout
+
+    def test_multiple_rw_mounts(self) -> None:
+        """Test multiple read-write mounts."""
+        code, stdout, stderr = run_bww('--rw', '/home', '--rw', '/var', '--dry-run', 'test')
+        assert code == 0
+        assert stdout.count('--bind') >= 2
+
+    def test_validate_flag(self) -> None:
+        """Test --validate flag for config checking."""
+        code, stdout, stderr = run_bww('--validate')
+        assert code == 0
+        assert '[OK]' in stdout
+        assert 'valid' in stdout.lower()
+
+    def test_validate_with_config_file(self) -> None:
+        """Test --validate with example config file."""
+        code, stdout, stderr = run_bww('--config', 'example/config.kdl', '--validate')
+        assert code == 0
+        assert '[OK]' in stdout
+
+    def test_no_default_flag(self) -> None:
+        """Test --no-default flag prevents command defaults."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = Path(tmpdir) / 'config.kdl'
+            config_file.write_text(
+                """
+defaults.test {
+  rw "/should/not/appear"
+}
+"""
+            )
+            code, stdout, stderr = run_bww('--config', str(config_file), '-n', '--dry-run', 'test')
+            assert code == 0
+            # The /should/not/appear should not be in the bwrap command
+            assert '/should/not/appear' not in stdout

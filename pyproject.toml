@@ -1,0 +1,30 @@
+[project]
+name = "bww"
+version = "0.1.0"
+authors = [
+    {name = "SharzyL", email = "me@sharzy.in"},
+]
+dependencies = [
+    "kdl-py>=1.2.0",
+]
+requires-python = ">=3.12"
+license = "MIT"
+
+[project.scripts]
+bww = "bww:main"
+
+[build-system]
+requires = ["uv_build"]
+build-backend = "uv_build"
+
+[tool.uv]
+package = true
+
+[tool.ruff]
+line-length = 120
+format.quote-style = "single"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]

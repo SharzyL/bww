@@ -1,0 +1,64 @@
+// Example BWW configuration (KDL)
+// Place this in $XDG_CONFIG_HOME/bww/config.kdl or ~/.config/bww/config.kdl
+//
+// Notes:
+// - This file uses a flat naming style (e.g. `profiles.desktop { ... }`).
+// - Lists are expressed as repeated nodes (e.g. multiple `ro` lines).
+// - Specifiers: %E=config, %C=cache, %D=data, %S=state, %t=runtime, %h=home.
+// - Env: ${ENV_NAME} expands from the environment.
+
+profiles.dev {
+  tmpfs "~" // Tmpfs home directory
+  rw "." // Read-write current directory
+  ro "/nix/store"
+  ro "/etc/static"
+}
+
+profiles.desktop {
+  tmpfs "~" // Tmpfs home directory
+  dev-bind true
+
+  // Read-only system files
+  ro "/nix/store"
+  ro "%E/gtk-*.0"
+  ro "%E/glib-2.0"
+  ro "%E/mimeapps.list"
+  ro "%D/fonts"
+  ro "%D/icons"
+  ro "/etc/fonts"
+  ro "/etc/static"
+  ro "/etc/alsa"
+  ro "/etc/dbus-1"
+  ro "/run/opengl-driver"
+  ro "%S/nix/profile/share/fonts"
+  ro "/sys"
+
+  rw "."
+  rw "/run/dbus"
+  rw "%t"
+  rw "%C/fontconfig"
+}
+
+defaults.chromium {
+  inherit "desktop"
+  share-net true
+  share-pid true
+  share-ipc true
+  share-user true
+
+  ro "/etc/passwd"
+  ro "/etc/group"
+
+  rw "%C/chromium"
+  rw "%E/chromium"
+}
+
+defaults.firefox {
+  inherit "desktop"
+  rw "~/.mozilla"
+}
+
+defaults.fish {
+  inherit "dev"
+  rw "~/.config/fish"
+}
