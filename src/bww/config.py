@@ -1,6 +1,7 @@
 """Configuration loading, parsing, and management."""
 
 import argparse
+import fnmatch
 import os
 import getpass
 import re
@@ -43,6 +44,8 @@ class Profile:
     ro: list[str] = field(default_factory=list)
     tmpfs: list[str] = field(default_factory=list)
     bwargs: list[str] = field(default_factory=list)
+    set_env: list[tuple[str, str]] = field(default_factory=list)
+    unset_env: list[str] = field(default_factory=list)
     share_net: bool = False
     dev_bind: bool = False
     reuse_session: bool = False
@@ -68,6 +71,8 @@ class RuntimeConfig:
     command: list[str]
     mounts: set[Mount] = field(default_factory=set)
     bwargs: list[str] = field(default_factory=list)
+    set_env: list[tuple[str, str]] = field(default_factory=list)
+    unset_env: list[str] = field(default_factory=list)
     share_net: bool = False
     dev_bind: bool = False
     reuse_session: bool = False
@@ -227,6 +232,70 @@ def expand_glob_pattern(pattern: str, config_dir: Path) -> list[str]:
     return [str(path)]
 
 
+def _parse_cli_set_env(items: list[str]) -> list[tuple[str, str]]:
+    """
+    Parse repeated --set-env KEY=VALUE CLI arguments into (key, value) tuples.
+
+    Args:
+        items: List of "KEY=VALUE" strings from argparse
+
+    Returns:
+        List of (key, value) tuples in CLI order
+
+    Raises:
+        ConfigError: If any item is not in KEY=VALUE form, or KEY is empty
+    """
+    out: list[tuple[str, str]] = []
+    for raw in items:
+        if '=' not in raw:
+            raise ConfigError(f'--set-env requires KEY=VALUE format, got: {raw!r}')
+        key, value = raw.split('=', 1)
+        if not key:
+            raise ConfigError(f'--set-env KEY cannot be empty: {raw!r}')
+        out.append((key, value))
+    return out
+
+
+def resolve_env_directives(
+    set_env_pairs: list[tuple[str, str]],
+    unset_env_patterns: list[str],
+    environ: dict[str, str] | None = None,
+) -> tuple[list[tuple[str, str]], list[str]]:
+    """
+    Resolve set-env values and unset-env patterns.
+
+    For set-env: expands ${ENV_NAME} in values against `environ`.
+    For unset-env: expands ${ENV_NAME} in patterns, then matches each pattern
+    against `environ` keys using fnmatch (case-sensitive). Vars also being set
+    are excluded from the unset list (set-env wins).
+
+    Args:
+        set_env_pairs: (key, value) pairs in order; later pairs override earlier
+        unset_env_patterns: glob patterns for env vars to unset
+        environ: environment dict to resolve against (defaults to os.environ)
+
+    Returns:
+        (resolved_set_env, resolved_unset_vars). set-env preserves input order;
+        unset-env returns a deduplicated, sorted list of concrete var names.
+    """
+    if environ is None:
+        environ = dict(os.environ)
+
+    resolved_set: list[tuple[str, str]] = [(k, _expand_env_vars(v)) for k, v in set_env_pairs]
+
+    set_keys = {k for k, _ in resolved_set}
+    matched: set[str] = set()
+    for pat in unset_env_patterns:
+        expanded_pat = _expand_env_vars(pat)
+        for var in environ:
+            if var in set_keys:
+                continue
+            if fnmatch.fnmatchcase(var, expanded_pat):
+                matched.add(var)
+
+    return resolved_set, sorted(matched)
+
+
 def parse_bwargs(bwargs_str: str) -> list[str]:
     """
     Parse space-separated bwrap arguments.
@@ -320,6 +389,14 @@ def _kdl_profile_to_dict(node: kdl.Node) -> dict[str, Any]:
             val = n.args[0]
         return val
 
+    def _kv_pairs(key: str) -> list[tuple[str, str]]:
+        out: list[tuple[str, str]] = []
+        for n in list(node.getAll(key)):
+            if len(n.args) != 2 or not all(isinstance(a, str) for a in n.args):
+                raise ConfigError(f'Profile [{node.name}] {key} must be: {key} "KEY" "VALUE"')
+            out.append((n.args[0], n.args[1]))
+        return out
+
     data: dict[str, Any] = {}
     inherit = _strings('inherit')
     if inherit:
@@ -329,6 +406,14 @@ def _kdl_profile_to_dict(node: kdl.Node) -> dict[str, Any]:
         vals = _strings(key)
         if vals:
             data[key] = vals
+
+    set_env = _kv_pairs('set-env')
+    if set_env:
+        data['set_env'] = set_env
+
+    unset_env = _strings('unset-env')
+    if unset_env:
+        data['unset_env'] = unset_env
 
     for opt in BOOL_OPTIONS:
         data[opt.key] = _bool(opt.key)
@@ -364,6 +449,8 @@ def _parse_profile(name: str, data: dict[str, Any]) -> Profile:
     ro = _normalize_path_list(data.get('ro', []), f'Profile [{name}] ro')
     tmpfs = _normalize_path_list(data.get('tmpfs', []), f'Profile [{name}] tmpfs')
     bwargs = _normalize_path_list(data.get('bwargs', []), f'Profile [{name}] bwargs')
+    set_env = _normalize_kv_pairs(data.get('set_env', []), f'Profile [{name}] set-env')
+    unset_env = _normalize_path_list(data.get('unset_env', []), f'Profile [{name}] unset-env')
 
     bool_kwargs: dict[str, bool] = {}
     for opt in BOOL_OPTIONS:
@@ -376,6 +463,8 @@ def _parse_profile(name: str, data: dict[str, Any]) -> Profile:
         ro=ro,
         tmpfs=tmpfs,
         bwargs=bwargs,
+        set_env=set_env,
+        unset_env=unset_env,
         **bool_kwargs,
     )
 
@@ -404,8 +493,40 @@ def _normalize_path_list(value: Any, context: str) -> list[str]:
         return value
     if isinstance(value, dict):
         # Support dict-style with keys as paths
-        return list(value.keys())
+        keys: list[str] = []
+        for k in value:
+            if not isinstance(k, str):
+                raise ConfigError(f'{context} dict keys must be strings')
+            keys.append(k)
+        return keys
     raise ConfigError(f'{context} must be string, list, or dict')
+
+
+def _normalize_kv_pairs(value: Any, context: str) -> list[tuple[str, str]]:
+    """
+    Normalize a sequence of (key, value) pairs.
+
+    Accepts a list of 2-tuples (or 2-element lists/tuples) of strings.
+
+    Args:
+        value: Value from config (list of 2-tuples)
+        context: Context for error messages
+
+    Returns:
+        List of (key, value) string tuples
+
+    Raises:
+        ConfigError: If value type is invalid
+    """
+    if not isinstance(value, list):
+        raise ConfigError(f'{context} must be a list of (KEY, VALUE) pairs')
+    out: list[tuple[str, str]] = []
+    for v in value:
+        if isinstance(v, (tuple, list)) and len(v) == 2 and all(isinstance(x, str) for x in v):
+            out.append((v[0], v[1]))
+        else:
+            raise ConfigError(f'{context} entries must be (KEY, VALUE) string pairs')
+    return out
 
 
 def _get_bool(data: dict[str, Any], key: str, context: str, default: bool = False) -> bool:
@@ -467,6 +588,8 @@ def resolve_profile(profile: Profile, all_profiles: dict[str, Profile], visited:
         resolved.ro.extend(parent.ro)
         resolved.tmpfs.extend(parent.tmpfs)
         resolved.bwargs.extend(parent.bwargs)
+        resolved.set_env.extend(parent.set_env)
+        resolved.unset_env.extend(parent.unset_env)
         for opt in BOOL_OPTIONS:
             setattr(resolved, opt.dest, getattr(resolved, opt.dest) or getattr(parent, opt.dest))
 
@@ -475,6 +598,8 @@ def resolve_profile(profile: Profile, all_profiles: dict[str, Profile], visited:
     resolved.ro.extend(profile.ro)
     resolved.tmpfs.extend(profile.tmpfs)
     resolved.bwargs.extend(profile.bwargs)
+    resolved.set_env.extend(profile.set_env)
+    resolved.unset_env.extend(profile.unset_env)
     for opt in BOOL_OPTIONS:
         setattr(resolved, opt.dest, getattr(resolved, opt.dest) or getattr(profile, opt.dest))
 
@@ -512,6 +637,8 @@ def resolve_profile_chain(profile: Profile, all_profiles: dict[str, Profile]) ->
             resolved.ro.extend(parent_resolved.ro)
             resolved.tmpfs.extend(parent_resolved.tmpfs)
             resolved.bwargs.extend(parent_resolved.bwargs)
+            resolved.set_env.extend(parent_resolved.set_env)
+            resolved.unset_env.extend(parent_resolved.unset_env)
             for opt in BOOL_OPTIONS:
                 setattr(resolved, opt.dest, getattr(resolved, opt.dest) or getattr(parent_resolved, opt.dest))
 
@@ -519,6 +646,8 @@ def resolve_profile_chain(profile: Profile, all_profiles: dict[str, Profile]) ->
         resolved.ro.extend(p.ro)
         resolved.tmpfs.extend(p.tmpfs)
         resolved.bwargs.extend(p.bwargs)
+        resolved.set_env.extend(p.set_env)
+        resolved.unset_env.extend(p.unset_env)
         for opt in BOOL_OPTIONS:
             setattr(resolved, opt.dest, getattr(resolved, opt.dest) or getattr(p, opt.dest))
 
@@ -616,6 +745,8 @@ def build_runtime_config(config: Config, args: argparse.Namespace, command: list
         merged_profile.ro.extend(default.ro)
         merged_profile.tmpfs.extend(default.tmpfs)
         merged_profile.bwargs.extend(default.bwargs)
+        merged_profile.set_env.extend(default.set_env)
+        merged_profile.unset_env.extend(default.unset_env)
         for opt in BOOL_OPTIONS:
             setattr(merged_profile, opt.dest, getattr(merged_profile, opt.dest) or getattr(default, opt.dest))
 
@@ -664,6 +795,8 @@ def build_runtime_config(config: Config, args: argparse.Namespace, command: list
         merged_profile.ro.extend(profile.ro)
         merged_profile.tmpfs.extend(profile.tmpfs)
         merged_profile.bwargs.extend(profile.bwargs)
+        merged_profile.set_env.extend(profile.set_env)
+        merged_profile.unset_env.extend(profile.unset_env)
         for opt in BOOL_OPTIONS:
             setattr(merged_profile, opt.dest, getattr(merged_profile, opt.dest) or getattr(profile, opt.dest))
 
@@ -673,6 +806,8 @@ def build_runtime_config(config: Config, args: argparse.Namespace, command: list
         'ro': getattr(args, 'ro', []),
         'tmpfs': getattr(args, 'tmpfs', []),
         'bwargs': parse_bwargs(args.bwargs) if getattr(args, 'bwargs', None) else [],
+        'set_env': _parse_cli_set_env(getattr(args, 'set_env', []) or []),
+        'unset_env': list(getattr(args, 'unset_env', []) or []),
     }
     for opt in BOOL_OPTIONS:
         cli_data[opt.key] = bool(getattr(args, opt.dest, False))
@@ -682,6 +817,8 @@ def build_runtime_config(config: Config, args: argparse.Namespace, command: list
     merged_profile.ro.extend(cli_profile.ro)
     merged_profile.tmpfs.extend(cli_profile.tmpfs)
     merged_profile.bwargs.extend(cli_profile.bwargs)
+    merged_profile.set_env.extend(cli_profile.set_env)
+    merged_profile.unset_env.extend(cli_profile.unset_env)
     for opt in BOOL_OPTIONS:
         setattr(merged_profile, opt.dest, getattr(merged_profile, opt.dest) or getattr(cli_profile, opt.dest))
 
@@ -711,7 +848,7 @@ def build_runtime_config(config: Config, args: argparse.Namespace, command: list
 
     expanded_command = list(command)
     if not expanded_command:
-        raise ConfigError("empty command")
+        raise ConfigError('empty command')
 
     exe = expanded_command[0]
     # If the user provided a path-like executable, expand it to an absolute path.
@@ -762,11 +899,18 @@ def build_runtime_config(config: Config, args: argparse.Namespace, command: list
             if Path(etc_path).exists():
                 unique_mounts[etc_path] = Mount(etc_path, 'ro')
 
+    resolved_set_env, resolved_unset_env = resolve_env_directives(
+        merged_profile.set_env,
+        merged_profile.unset_env,
+    )
+
     return RuntimeConfig(
         argv0=raw_exe,
         command=expanded_command,
         mounts=set(unique_mounts.values()),
         bwargs=merged_profile.bwargs,
+        set_env=resolved_set_env,
+        unset_env=resolved_unset_env,
         **{opt.dest: getattr(merged_profile, opt.dest) for opt in BOOL_OPTIONS},
         debug=getattr(args, 'debug', False),
         debug_tmpfs=getattr(args, 'debug_tmpfs', False),

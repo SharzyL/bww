@@ -75,6 +75,25 @@ def create_parser() -> argparse.ArgumentParser:
         help='Extra bwrap arguments (space-separated string)',
     )
 
+    parser.add_argument(
+        '--set-env',
+        action='append',
+        default=[],
+        metavar='KEY=VALUE',
+        dest='set_env',
+        help='Set env var inside sandbox (repeatable). VALUE supports ${VAR} expansion',
+    )
+
+    parser.add_argument(
+        '--unset-env',
+        action='append',
+        default=[],
+        metavar='PATTERN',
+        dest='unset_env',
+        help='Unset env vars matching PATTERN inside sandbox (repeatable). Supports glob '
+        'wildcards (*, ?, [abc]) and ${VAR} expansion',
+    )
+
     for opt in BOOL_OPTIONS:
         parser.add_argument(
             opt.cli_flag,

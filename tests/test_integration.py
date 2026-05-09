@@ -5,6 +5,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import pytest
+
 
 # Find project root (directory containing pyproject.toml)
 def _get_project_root() -> Path:
@@ -114,7 +116,7 @@ class TestCLIParsing:
         import shutil
 
         resolved = shutil.which('echo')
-        if not resolved:
+        if resolved is None:
             pytest.skip('echo not found in PATH')
 
         kdl_cfg = f"""
@@ -259,6 +261,96 @@ profiles.p {{
         code, stdout, stderr = run_bww('--config', 'example/config.kdl', '--validate')
         assert code == 0
         assert '[OK]' in stdout
+
+    def test_set_env_cli(self) -> None:
+        """--set-env produces a --setenv arg in the bwrap command."""
+        code, stdout, stderr = run_bww('--set-env', 'FOO=bar', '--dry-run', 'echo')
+        assert code == 0
+        clean = _strip_ansi(stdout)
+        assert '--setenv FOO bar' in clean
+
+    def test_set_env_cli_value_expanded(self) -> None:
+        """--set-env value supports ${VAR} expansion against parent shell."""
+        code, stdout, stderr = run_bww_with_env(
+            {'BWW_TARGET': '/some/path'}, '--set-env', 'TGT=${BWW_TARGET}/sub', '--dry-run', 'echo'
+        )
+        assert code == 0
+        clean = _strip_ansi(stdout)
+        assert '--setenv TGT /some/path/sub' in clean
+
+    def test_set_env_cli_invalid_format(self) -> None:
+        """--set-env without '=' is rejected with a clear error."""
+        code, stdout, stderr = run_bww('--set-env', 'NOEQUALS', '--dry-run', 'echo')
+        assert code == 1
+        assert 'KEY=VALUE' in stderr
+
+    def test_unset_env_cli_wildcards(self) -> None:
+        """--unset-env expands wildcards against the calling environment."""
+        code, stdout, stderr = run_bww_with_env(
+            {'BWW_INTEG_A': '1', 'BWW_INTEG_B': '2'},
+            '--unset-env',
+            'BWW_INTEG_*',
+            '--dry-run',
+            'echo',
+        )
+        assert code == 0
+        clean = _strip_ansi(stdout)
+        assert '--unsetenv BWW_INTEG_A' in clean
+        assert '--unsetenv BWW_INTEG_B' in clean
+
+    def test_set_env_kdl_with_expansion(self) -> None:
+        """KDL set-env "KEY" "${HOST_VAR}/sub" expands at build time."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = Path(tmpdir) / 'config.kdl'
+            cfg.write_text(
+                """
+profiles.envp {
+  set-env "TGT" "${BWW_HOST_VAR}/sub"
+  unset-env "BWW_DROP_*"
+}
+"""
+            )
+            code, stdout, stderr = run_bww_with_env(
+                {'BWW_HOST_VAR': '/host', 'BWW_DROP_X': '1', 'BWW_DROP_Y': '2'},
+                '--config',
+                str(cfg),
+                '-p',
+                'envp',
+                '--dry-run',
+                'echo',
+            )
+            assert code == 0, stderr
+            clean = _strip_ansi(stdout)
+            assert '--setenv TGT /host/sub' in clean
+            assert '--unsetenv BWW_DROP_X' in clean
+            assert '--unsetenv BWW_DROP_Y' in clean
+
+    def test_set_env_excludes_var_from_unset_in_dry_run(self) -> None:
+        """A var listed in set-env should not also be emitted as --unsetenv."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = Path(tmpdir) / 'config.kdl'
+            cfg.write_text(
+                """
+profiles.envp {
+  set-env "BWW_KEEP_X" "kept"
+  unset-env "BWW_KEEP_*"
+}
+"""
+            )
+            code, stdout, stderr = run_bww_with_env(
+                {'BWW_KEEP_X': 'orig', 'BWW_KEEP_Y': 'gone'},
+                '--config',
+                str(cfg),
+                '-p',
+                'envp',
+                '--dry-run',
+                'echo',
+            )
+            assert code == 0
+            clean = _strip_ansi(stdout)
+            assert '--setenv BWW_KEEP_X kept' in clean
+            assert '--unsetenv BWW_KEEP_X' not in clean
+            assert '--unsetenv BWW_KEEP_Y' in clean
 
     def test_no_default_flag(self) -> None:
         """Test --no-default flag prevents command defaults."""

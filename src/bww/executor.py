@@ -51,6 +51,8 @@ def format_bwrap_command(argv: list[str]) -> str:
         '--argv0': 1,
         '--bind': 2,
         '--ro-bind': 2,
+        '--setenv': 2,
+        '--unsetenv': 1,
     }
 
     i = 1
@@ -193,6 +195,13 @@ def build_bwrap_command(runtime_config: 'RuntimeConfig') -> list[str]:
             cmd.extend(['--bind', mount.path, mount.path])
         elif mount.mode == 'ro':
             cmd.extend(['--ro-bind', mount.path, mount.path])
+
+    # Emit env directives. Unset first so set-env wins on overlap (bwrap applies
+    # args in order). Both lists are already resolved/expanded by build_runtime_config.
+    for var in runtime_config.unset_env:
+        cmd.extend(['--unsetenv', var])
+    for key, value in runtime_config.set_env:
+        cmd.extend(['--setenv', key, value])
 
     # Add custom bwrap arguments
     cmd.extend(runtime_config.bwargs)

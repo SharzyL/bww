@@ -45,6 +45,10 @@
           uv
           ty
           ruff
+
+          tun2socks
+          bubblewrap
+          passt
         ]);
         # to allow lsp to find python
         shellHook = ''

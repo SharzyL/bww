@@ -1,5 +1,6 @@
 """Unit tests for BWW configuration module."""
 
+import os
 import tempfile
 from pathlib import Path
 
@@ -549,6 +550,200 @@ class TestRuntimeConfigBuilding:
         assert any(m.path == '/var' for m in runtime.mounts)
         assert any(m.path == '/etc' for m in runtime.mounts)
         assert any(m.path == '/tmp' for m in runtime.mounts)
+
+    def test_set_env_merges_from_profile(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """set-env values flow into runtime, with ${VAR} expanded against parent env."""
+        import argparse
+
+        monkeypatch.setenv('SOME_HOME', '/tmp/x')
+
+        config = Config(profiles={'p': Profile(name='p', set_env=[('FOO', 'bar'), ('BAZ', '${SOME_HOME}/q')])})
+        args = argparse.Namespace(
+            config=None,
+            profile='p',
+            no_default=False,
+            rw=[],
+            ro=[],
+            tmpfs=[],
+            bwargs=None,
+            set_env=[],
+            unset_env=[],
+            share_net=False,
+            share_user=False,
+            share_ipc=False,
+            share_pid=False,
+            share_uts=False,
+            dev_bind=False,
+            reuse_session=False,
+            debug=False,
+            debug_tmpfs=False,
+        )
+        runtime = build_runtime_config(config, args, ['echo'])
+        assert ('FOO', 'bar') in runtime.set_env
+        assert ('BAZ', '/tmp/x/q') in runtime.set_env
+
+    def test_unset_env_wildcards_match_environ(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """unset-env patterns match against current environ via fnmatch."""
+        import argparse
+
+        # Clean any existing matches and set a known set.
+        for k in list(os.environ):
+            if k.startswith('BWW_TEST_'):
+                monkeypatch.delenv(k, raising=False)
+        monkeypatch.setenv('BWW_TEST_A', '1')
+        monkeypatch.setenv('BWW_TEST_B', '2')
+        monkeypatch.setenv('BWW_OTHER', '3')
+
+        config = Config(profiles={'p': Profile(name='p', unset_env=['BWW_TEST_*'])})
+        args = argparse.Namespace(
+            config=None,
+            profile='p',
+            no_default=False,
+            rw=[],
+            ro=[],
+            tmpfs=[],
+            bwargs=None,
+            set_env=[],
+            unset_env=[],
+            share_net=False,
+            share_user=False,
+            share_ipc=False,
+            share_pid=False,
+            share_uts=False,
+            dev_bind=False,
+            reuse_session=False,
+            debug=False,
+            debug_tmpfs=False,
+        )
+        runtime = build_runtime_config(config, args, ['echo'])
+        assert 'BWW_TEST_A' in runtime.unset_env
+        assert 'BWW_TEST_B' in runtime.unset_env
+        assert 'BWW_OTHER' not in runtime.unset_env
+
+    def test_unset_env_pattern_supports_env_expansion(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """${VAR} expansion happens before fnmatch matching of unset-env patterns."""
+        import argparse
+
+        for k in list(os.environ):
+            if k.startswith('BWW_PFX_'):
+                monkeypatch.delenv(k, raising=False)
+        monkeypatch.setenv('BWW_PFX_X', '1')
+        monkeypatch.setenv('BWW_PFX_Y', '2')
+        monkeypatch.setenv('BWW_PREFIX', 'BWW_PFX')
+
+        config = Config(profiles={'p': Profile(name='p', unset_env=['${BWW_PREFIX}_*'])})
+        args = argparse.Namespace(
+            config=None,
+            profile='p',
+            no_default=False,
+            rw=[],
+            ro=[],
+            tmpfs=[],
+            bwargs=None,
+            set_env=[],
+            unset_env=[],
+            share_net=False,
+            share_user=False,
+            share_ipc=False,
+            share_pid=False,
+            share_uts=False,
+            dev_bind=False,
+            reuse_session=False,
+            debug=False,
+            debug_tmpfs=False,
+        )
+        runtime = build_runtime_config(config, args, ['echo'])
+        assert 'BWW_PFX_X' in runtime.unset_env
+        assert 'BWW_PFX_Y' in runtime.unset_env
+
+    def test_set_env_excludes_var_from_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A var named in set-env should not appear in resolved unset-env."""
+        import argparse
+
+        monkeypatch.setenv('BWW_KEEP_A', 'x')
+        monkeypatch.setenv('BWW_KEEP_B', 'y')
+
+        config = Config(
+            profiles={
+                'p': Profile(
+                    name='p',
+                    set_env=[('BWW_KEEP_A', 'replaced')],
+                    unset_env=['BWW_KEEP_*'],
+                )
+            }
+        )
+        args = argparse.Namespace(
+            config=None,
+            profile='p',
+            no_default=False,
+            rw=[],
+            ro=[],
+            tmpfs=[],
+            bwargs=None,
+            set_env=[],
+            unset_env=[],
+            share_net=False,
+            share_user=False,
+            share_ipc=False,
+            share_pid=False,
+            share_uts=False,
+            dev_bind=False,
+            reuse_session=False,
+            debug=False,
+            debug_tmpfs=False,
+        )
+        runtime = build_runtime_config(config, args, ['echo'])
+        assert ('BWW_KEEP_A', 'replaced') in runtime.set_env
+        assert 'BWW_KEEP_A' not in runtime.unset_env
+        assert 'BWW_KEEP_B' in runtime.unset_env
+
+    def test_set_env_inheritance_concatenates(self) -> None:
+        """set-env from parent and child concatenate; child appended last (wins on bwrap apply)."""
+        parent = Profile(name='parent', set_env=[('FOO', 'parent_val')])
+        child = Profile(name='child', inherit=['parent'], set_env=[('FOO', 'child_val'), ('BAR', 'b')])
+        all_profiles = {'parent': parent, 'child': child}
+        resolved = resolve_profile(child, all_profiles)
+        assert resolved.set_env == [('FOO', 'parent_val'), ('FOO', 'child_val'), ('BAR', 'b')]
+
+    def test_unset_env_inheritance_concatenates(self) -> None:
+        """unset-env patterns from parent and child concatenate."""
+        parent = Profile(name='parent', unset_env=['A_*'])
+        child = Profile(name='child', inherit=['parent'], unset_env=['B_*'])
+        all_profiles = {'parent': parent, 'child': child}
+        resolved = resolve_profile(child, all_profiles)
+        assert resolved.unset_env == ['A_*', 'B_*']
+
+    def test_load_set_env_unset_env_from_kdl(self) -> None:
+        """KDL set-env "KEY" "VALUE" and unset-env "PAT" "PAT2" parse correctly."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = Path(tmpdir) / 'config.kdl'
+            config_file.write_text(
+                """
+profiles.test {
+  set-env "FOO" "bar"
+  set-env "BAZ" "qux"
+  unset-env "SSH_*"
+  unset-env "AWS_*" "GOOGLE_*"
+}
+"""
+            )
+            config = load_config(str(config_file))
+            assert config.profiles['test'].set_env == [('FOO', 'bar'), ('BAZ', 'qux')]
+            assert config.profiles['test'].unset_env == ['SSH_*', 'AWS_*', 'GOOGLE_*']
+
+    def test_load_set_env_wrong_arity_raises(self) -> None:
+        """set-env with the wrong number of args is a clear error."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = Path(tmpdir) / 'config.kdl'
+            config_file.write_text(
+                """
+profiles.test {
+  set-env "FOO"
+}
+"""
+            )
+            with pytest.raises(ConfigError, match='set-env'):
+                load_config(str(config_file))
 
     def test_build_runtime_config_no_command_error(self) -> None:
         """Test error when no command provided."""

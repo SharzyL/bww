@@ -66,6 +66,9 @@ Options:
   --ro PATH           Read-only mount (repeatable)
   --tmpfs PATH        Tmpfs mount (repeatable)
   --bwargs ARGS       Extra bwrap arguments (space-separated)
+  --set-env KEY=VALUE Set env var inside sandbox (repeatable; ${VAR} expanded in VALUE)
+  --unset-env PATTERN Unset env vars matching PATTERN inside sandbox (repeatable;
+                      supports glob wildcards `*`, `?`, `[abc]` and ${VAR} expansion)
   --share-net         Share the host network namespace (omit bwrap --unshare-net)
   --share-user        Share the host user namespace (omit bwrap --unshare-user)
   --share-ipc         Share the host IPC namespace (omit bwrap --unshare-ipc)
@@ -78,6 +81,25 @@ Options:
   --validate          Validate configuration and exit
   --dry-run           Show what would be executed without running
 ```
+
+### Environment Variables
+
+Profiles and the CLI can shape the sandbox environment with `set-env` and `unset-env`.
+
+```kdl
+profiles.scrub {
+  set-env "PATH" "/usr/bin:${HOME}/.local/bin"   // ${ENV} expanded against parent shell
+  unset-env "SSH_*" "AWS_*"                       // glob wildcards (fnmatch)
+}
+```
+
+- `set-env "KEY" "VALUE"` — emits `--setenv KEY VALUE` to bwrap. `${VAR}` is expanded in `VALUE`
+  against the calling shell's environment. Later definitions for the same `KEY`
+  (down the inheritance chain or on the CLI) override earlier ones.
+- `unset-env "PATTERN"` — patterns are fnmatch-style globs (`*`, `?`, `[abc]`).
+  `${VAR}` is expanded in the pattern, then the result is matched against the
+  calling shell's environment; each match emits `--unsetenv VAR` to bwrap. Vars
+  also covered by `set-env` are skipped (set-env wins).
 
 ### Examples
 

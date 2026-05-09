@@ -12,6 +12,12 @@ profiles.dev {
   rw "." // Read-write current directory
   ro "/nix/store"
   ro "/etc/static"
+
+  // Sandbox environment. Both set-env and unset-env support ${ENV} expansion.
+  // unset-env additionally supports glob wildcards (*, ?, [abc]).
+  set-env "PATH" "/run/current-system/sw/bin:${HOME}/.local/bin"
+  unset-env "SSH_*" // strip SSH agent vars
+  unset-env "AWS_*" "GOOGLE_*" // strip cloud creds
 }
 
 profiles.desktop {
