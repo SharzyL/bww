@@ -62,6 +62,9 @@ defaults.chromium {
 defaults.firefox {
   inherit "desktop"
   rw "~/.mozilla"
+  // 2-arg form: bind a host path to a different location inside the sandbox.
+  // (Demo only — remove if not needed.)
+  ro "/etc/resolv.conf" "/etc/resolv.conf.host"
 }
 
 defaults.fish {

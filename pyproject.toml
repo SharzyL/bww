@@ -6,6 +6,7 @@ authors = [
 ]
 dependencies = [
     "kdl-py>=1.2.0",
+    "loguru>=0.7",
 ]
 requires-python = ">=3.12"
 license = "MIT"
@@ -23,8 +24,21 @@ package = true
 [tool.ruff]
 line-length = 120
 format.quote-style = "single"
+lint.select = ["E4", "E7", "E9", "F", "B"]
 
 [dependency-groups]
 dev = [
+    "basedpyright>=1.39",
     "pytest>=9.0.2",
 ]
+
+[tool.basedpyright]
+include = ["src", "tests"]
+# "standard" gives the same checks as upstream pyright. "all" / "strict"
+# add many `reportAny` / `reportUnknownMemberType` warnings that are noisy
+# for argparse-driven code and registry dispatch.
+typeCheckingMode = "standard"
+pythonVersion = "3.12"
+# kdl-py doesn't declare __all__; its documented surface (parse/Node/ParseError)
+# triggers reportPrivateImportUsage. Treat the package as public.
+reportPrivateImportUsage = "none"

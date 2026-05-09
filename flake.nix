@@ -13,7 +13,7 @@
   outputs = { flake-parts, ... }@inputs:
     let
       name = "bww";
-      makePkg = { lib, buildPythonPackage, uv-build, kdl-py, pytest }:
+      makePkg = { lib, buildPythonPackage, uv-build, kdl-py, pytest, loguru }:
         buildPythonPackage {
           pname = name;
           version = "0.1.0";
@@ -22,6 +22,7 @@
 
           propagatedBuildInputs = [
             kdl-py
+            loguru
           ];
 
           checkInputs = [

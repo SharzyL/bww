@@ -6,16 +6,24 @@ from pathlib import Path
 
 import pytest
 
-from bww.config import (
-    Config,
-    ConfigError,
-    Mount,
-    Profile,
-    build_runtime_config,
-    load_config,
-    resolve_profile,
-    validate_config,
-)
+from bww.loader import load_config
+from bww.models import Config, ConfigError, Mount, MountEntry, Profile, verify_options_invariant
+from bww.runtime import build_runtime_config, resolve_profile, validate_config
+
+
+def test_options_invariant_holds() -> None:
+    """Every OPTIONS spec has matching dataclass fields on Profile/RuntimeConfig."""
+    verify_options_invariant()
+
+
+def _ip(*paths: str) -> list[MountEntry]:
+    """Test helper: build in-place MountEntry list from path strings."""
+    return [MountEntry(src=p, dest=p) for p in paths]
+
+
+def _tmpfs(*dests: str) -> list[MountEntry]:
+    """Test helper: build tmpfs MountEntry list (src=None)."""
+    return [MountEntry(src=None, dest=d) for d in dests]
 
 
 class TestConfigLoading:
@@ -42,9 +50,9 @@ profiles.test {
             )
             config = load_config(str(config_file))
             assert 'test' in config.profiles
-            assert config.profiles['test'].rw == ['/home']
-            assert config.profiles['test'].ro == ['/etc']
-            assert config.profiles['test'].tmpfs == ['/tmp']
+            assert config.profiles['test'].rw == _ip('/home')
+            assert config.profiles['test'].ro == _ip('/etc')
+            assert config.profiles['test'].tmpfs == _tmpfs('/tmp')
 
     def test_load_config_with_defaults(self) -> None:
         """Test loading config with command defaults."""
@@ -59,7 +67,7 @@ defaults.firefox {
             )
             config = load_config(str(config_file))
             assert 'firefox' in config.defaults
-            assert config.defaults['firefox'].rw == ['~/.mozilla']
+            assert config.defaults['firefox'].rw == _ip('~/.mozilla')
 
     def test_load_invalid_toml(self) -> None:
         """Test error on invalid KDL syntax."""
@@ -81,21 +89,66 @@ profiles.test {
 """
             )
             config = load_config(str(config_file))
-            assert config.profiles['test'].rw == ['/home']
+            assert config.profiles['test'].rw == _ip('/home')
 
-    def test_load_mount_as_list(self) -> None:
-        """Test loading mount paths as list."""
+    def test_load_mount_non_in_place(self) -> None:
+        """2-arg KDL form: rw "/host" "/sandbox" → non-in-place MountEntry."""
         with tempfile.TemporaryDirectory() as tmpdir:
             config_file = Path(tmpdir) / 'config.kdl'
             config_file.write_text(
                 """
 profiles.test {
-  rw "/home" "/var"
+  rw "/host/cache" "/sandbox/cache"
+  ro "/host/etc" "/sandbox/etc"
 }
 """
             )
             config = load_config(str(config_file))
-            assert set(config.profiles['test'].rw) == {'/home', '/var'}
+            assert config.profiles['test'].rw == [MountEntry(src='/host/cache', dest='/sandbox/cache')]
+            assert config.profiles['test'].ro == [MountEntry(src='/host/etc', dest='/sandbox/etc')]
+
+    def test_load_mount_tmpfs_rejects_two_args(self) -> None:
+        """tmpfs cannot take 2 args (it has no host source)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = Path(tmpdir) / 'config.kdl'
+            config_file.write_text(
+                """
+profiles.test {
+  tmpfs "/a" "/b"
+}
+"""
+            )
+            with pytest.raises(ConfigError, match='tmpfs'):
+                load_config(str(config_file))
+
+    def test_load_mount_three_args_rejected(self) -> None:
+        """Mount nodes with 3+ args are rejected."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = Path(tmpdir) / 'config.kdl'
+            config_file.write_text(
+                """
+profiles.test {
+  rw "/a" "/b" "/c"
+}
+"""
+            )
+            with pytest.raises(ConfigError, match='1 or 2 string args'):
+                load_config(str(config_file))
+
+    def test_load_mount_repeated(self) -> None:
+        """Multiple `rw` nodes accumulate as separate mounts."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = Path(tmpdir) / 'config.kdl'
+            config_file.write_text(
+                """
+profiles.test {
+  rw "/home"
+  rw "/var"
+}
+"""
+            )
+            config = load_config(str(config_file))
+            assert config.profiles['test'].rw == _ip('/home', '/var')
 
     def test_load_inherit_as_string(self) -> None:
         """Test inherit as single string."""
@@ -140,51 +193,51 @@ class TestProfileResolution:
 
     def test_resolve_no_inheritance(self) -> None:
         """Test resolving profile with no inheritance."""
-        profile = Profile(name='test', rw=['/home'], ro=['/etc'])
+        profile = Profile(name='test', rw=_ip('/home'), ro=_ip('/etc'))
         all_profiles = {'test': profile}
         resolved = resolve_profile(profile, all_profiles)
-        assert resolved.rw == ['/home']
-        assert resolved.ro == ['/etc']
+        assert resolved.rw == _ip('/home')
+        assert resolved.ro == _ip('/etc')
 
     def test_resolve_single_inheritance(self) -> None:
         """Test resolving profile with single parent."""
-        parent = Profile(name='parent', rw=['/home'])
-        child = Profile(name='child', inherit=['parent'], ro=['/etc'])
+        parent = Profile(name='parent', rw=_ip('/home'))
+        child = Profile(name='child', inherit=['parent'], ro=_ip('/etc'))
         all_profiles = {'parent': parent, 'child': child}
         resolved = resolve_profile(child, all_profiles)
-        assert resolved.rw == ['/home']
-        assert resolved.ro == ['/etc']
+        assert resolved.rw == _ip('/home')
+        assert resolved.ro == _ip('/etc')
 
     def test_resolve_inheritance_list_concatenation(self) -> None:
         """Test that lists are concatenated during inheritance."""
-        parent = Profile(name='parent', rw=['/a', '/b'])
-        child = Profile(name='child', inherit=['parent'], rw=['/c'])
+        parent = Profile(name='parent', rw=_ip('/a', '/b'))
+        child = Profile(name='child', inherit=['parent'], rw=_ip('/c'))
         all_profiles = {'parent': parent, 'child': child}
         resolved = resolve_profile(child, all_profiles)
         # Parent values first, then child
-        assert resolved.rw == ['/a', '/b', '/c']
+        assert resolved.rw == _ip('/a', '/b', '/c')
 
     def test_resolve_multiple_parents(self) -> None:
         """Test resolving profile with multiple parents."""
-        parent_a = Profile(name='parent_a', rw=['/a'])
-        parent_b = Profile(name='parent_b', rw=['/b'])
-        child = Profile(name='child', inherit=['parent_a', 'parent_b'], rw=['/c'])
+        parent_a = Profile(name='parent_a', rw=_ip('/a'))
+        parent_b = Profile(name='parent_b', rw=_ip('/b'))
+        child = Profile(name='child', inherit=['parent_a', 'parent_b'], rw=_ip('/c'))
         all_profiles = {'parent_a': parent_a, 'parent_b': parent_b, 'child': child}
         resolved = resolve_profile(child, all_profiles)
-        assert resolved.rw == ['/a', '/b', '/c']
+        assert resolved.rw == _ip('/a', '/b', '/c')
 
     def test_resolve_deep_inheritance(self) -> None:
         """Test resolving multi-level inheritance chain."""
-        grandparent = Profile(name='grandparent', rw=['/gp'])
-        parent = Profile(name='parent', inherit=['grandparent'], rw=['/p'])
-        child = Profile(name='child', inherit=['parent'], rw=['/c'])
+        grandparent = Profile(name='grandparent', rw=_ip('/gp'))
+        parent = Profile(name='parent', inherit=['grandparent'], rw=_ip('/p'))
+        child = Profile(name='child', inherit=['parent'], rw=_ip('/c'))
         all_profiles = {
             'grandparent': grandparent,
             'parent': parent,
             'child': child,
         }
         resolved = resolve_profile(child, all_profiles)
-        assert resolved.rw == ['/gp', '/p', '/c']
+        assert resolved.rw == _ip('/gp', '/p', '/c')
 
     def test_resolve_circular_inheritance(self) -> None:
         """Test that circular inheritance is detected."""
@@ -214,7 +267,7 @@ class TestConfigValidation:
         """Test validating valid config succeeds."""
         config = Config(
             profiles={
-                'test': Profile(name='test', rw=['/home']),
+                'test': Profile(name='test', rw=_ip('/home')),
             }
         )
         validate_config(config)  # Should not raise
@@ -236,9 +289,9 @@ class TestMount:
 
     def test_mount_hashable(self) -> None:
         """Test Mount objects are hashable."""
-        mount1 = Mount(path='/home', mode='rw')
-        mount2 = Mount(path='/home', mode='rw')
-        mount3 = Mount(path='/etc', mode='ro')
+        mount1 = Mount(src='/home', dest='/home', mode='rw')
+        mount2 = Mount(src='/home', dest='/home', mode='rw')
+        mount3 = Mount(src='/etc', dest='/etc', mode='ro')
 
         # Should work in sets
         mounts = {mount1, mount2, mount3}
@@ -246,20 +299,20 @@ class TestMount:
 
     def test_mount_equality(self) -> None:
         """Test Mount equality."""
-        mount1 = Mount(path='/home', mode='rw')
-        mount2 = Mount(path='/home', mode='rw')
+        mount1 = Mount(src='/home', dest='/home', mode='rw')
+        mount2 = Mount(src='/home', dest='/home', mode='rw')
         assert mount1 == mount2
 
     def test_mount_inequality_path(self) -> None:
         """Test Mount with different paths are not equal."""
-        mount1 = Mount(path='/home', mode='rw')
-        mount2 = Mount(path='/var', mode='rw')
+        mount1 = Mount(src='/home', dest='/home', mode='rw')
+        mount2 = Mount(src='/var', dest='/var', mode='rw')
         assert mount1 != mount2
 
     def test_mount_inequality_mode(self) -> None:
         """Test Mount with different modes are not equal."""
-        mount1 = Mount(path='/home', mode='rw')
-        mount2 = Mount(path='/home', mode='ro')
+        mount1 = Mount(src='/home', dest='/home', mode='rw')
+        mount2 = Mount(src='/home', dest='/home', mode='ro')
         assert mount1 != mount2
 
 
@@ -268,7 +321,7 @@ class TestPathExpansion:
 
     def test_expand_tilde(self) -> None:
         """Test ~ shell-style expansion."""
-        from bww.config import expand_path
+        from bww.expand import expand_path
 
         expanded = expand_path('~/test', Path('/tmp'))
         assert expanded.endswith('/test')
@@ -277,7 +330,7 @@ class TestPathExpansion:
 
     def test_expand_home_specifier(self) -> None:
         """Test %h systemd specifier expansion."""
-        from bww.config import expand_path
+        from bww.expand import expand_path
 
         expanded = expand_path('%h/test', Path('/tmp'))
         assert expanded.endswith('/test')
@@ -286,7 +339,7 @@ class TestPathExpansion:
 
     def test_expand_config_specifier(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Test %E specifier expansion to XDG config home."""
-        from bww.config import expand_path
+        from bww.expand import expand_path
 
         monkeypatch.setenv('XDG_CONFIG_HOME', '/tmp/xdg-config')
         expanded = expand_path('%E/gtk-4.0', Path('/tmp'))
@@ -295,7 +348,7 @@ class TestPathExpansion:
 
     def test_expand_cache_specifier(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Test %C specifier expansion to XDG cache home."""
-        from bww.config import expand_path
+        from bww.expand import expand_path
 
         monkeypatch.setenv('XDG_CACHE_HOME', '/tmp/xdg-cache')
         expanded = expand_path('%C/bww', Path('/tmp'))
@@ -304,7 +357,7 @@ class TestPathExpansion:
 
     def test_expand_state_specifier(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Test %S specifier expansion to XDG state home."""
-        from bww.config import expand_path
+        from bww.expand import expand_path
 
         monkeypatch.setenv('XDG_STATE_HOME', '/tmp/xdg-state')
         expanded = expand_path('%S/bww', Path('/tmp'))
@@ -313,7 +366,7 @@ class TestPathExpansion:
 
     def test_expand_data_specifier(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Test %D specifier expansion to XDG data home."""
-        from bww.config import expand_path
+        from bww.expand import expand_path
 
         monkeypatch.setenv('XDG_DATA_HOME', '/tmp/xdg-data')
         expanded = expand_path('%D/bww', Path('/tmp'))
@@ -322,7 +375,7 @@ class TestPathExpansion:
 
     def test_expand_runtime_specifier(self) -> None:
         """Test %t specifier expansion."""
-        from bww.config import expand_path
+        from bww.expand import expand_path
 
         expanded = expand_path('%t/myapp', Path('/tmp'))
         # %t should expand to XDG_RUNTIME_DIR
@@ -331,7 +384,7 @@ class TestPathExpansion:
 
     def test_expand_percent_escape(self) -> None:
         """Test %% escape for literal percent."""
-        from bww.config import expand_path
+        from bww.expand import expand_path
 
         expanded = expand_path('100%% complete', Path('/tmp'))
         assert '%%' not in expanded
@@ -339,14 +392,14 @@ class TestPathExpansion:
 
     def test_expand_relative_path(self) -> None:
         """Test relative path becomes absolute."""
-        from bww.config import expand_path
+        from bww.expand import expand_path
 
         expanded = expand_path('./test', Path('/tmp'))
         assert Path(expanded).is_absolute()
 
     def test_expand_env_var(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Test ${ENV_NAME} expansion."""
-        from bww.config import expand_path
+        from bww.expand import expand_path
 
         monkeypatch.setenv('BWW_TEST_ENV', '/tmp/bww-env')
         expanded = expand_path('${BWW_TEST_ENV}/x', Path('/tmp'))
@@ -354,7 +407,8 @@ class TestPathExpansion:
 
     def test_expand_env_var_missing_raises(self) -> None:
         """Test missing ${ENV_NAME} raises a ConfigError."""
-        from bww.config import ConfigError, expand_path
+        from bww.expand import expand_path
+        from bww.models import ConfigError
 
         with pytest.raises(ConfigError, match='Environment variable not set'):
             expand_path('${BWW_MISSING_ENV}/x', Path('/tmp'))
@@ -368,7 +422,7 @@ class TestRuntimeConfigBuilding:
         import argparse
         import shutil
 
-        config = Config(profiles={'test': Profile(name='test', rw=['/home'])})
+        config = Config(profiles={'test': Profile(name='test', rw=_ip('/home'))})
         args = argparse.Namespace(
             config=None,
             profile='test',
@@ -391,7 +445,7 @@ class TestRuntimeConfigBuilding:
 
         config = Config(
             profiles={},
-            defaults={'echo': Profile(name='echo', rw=['/home'])},
+            defaults={'echo': Profile(name='echo', rw=_ip('/home'))},
         )
         args = argparse.Namespace(
             config=None,
@@ -405,7 +459,7 @@ class TestRuntimeConfigBuilding:
             debug_tmpfs=False,
         )
         runtime = build_runtime_config(config, args, ['/bin/echo', 'test'])
-        assert any(m.path == '/home' and m.mode == 'rw' for m in runtime.mounts)
+        assert any(m.dest == '/home' and m.mode == 'rw' for m in runtime.mounts)
 
     def test_share_net_merges_from_profile(self) -> None:
         """share-net should flow from profile/default into runtime config."""
@@ -532,7 +586,7 @@ class TestRuntimeConfigBuilding:
         """Test CLI arguments override profile."""
         import argparse
 
-        config = Config(profiles={'test': Profile(name='test', rw=['/home'])})
+        config = Config(profiles={'test': Profile(name='test', rw=_ip('/home'))})
         args = argparse.Namespace(
             config=None,
             profile='test',
@@ -546,10 +600,10 @@ class TestRuntimeConfigBuilding:
         )
         runtime = build_runtime_config(config, args, ['test'])
         # Should have mounts from profile AND CLI
-        assert any(m.path == '/home' for m in runtime.mounts)
-        assert any(m.path == '/var' for m in runtime.mounts)
-        assert any(m.path == '/etc' for m in runtime.mounts)
-        assert any(m.path == '/tmp' for m in runtime.mounts)
+        assert any(m.dest == '/home' for m in runtime.mounts)
+        assert any(m.dest == '/var' for m in runtime.mounts)
+        assert any(m.dest == '/etc' for m in runtime.mounts)
+        assert any(m.dest == '/tmp' for m in runtime.mounts)
 
     def test_set_env_merges_from_profile(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """set-env values flow into runtime, with ${VAR} expanded against parent env."""
@@ -744,6 +798,75 @@ profiles.test {
             )
             with pytest.raises(ConfigError, match='set-env'):
                 load_config(str(config_file))
+
+    def test_mount_glob_with_explicit_dest_rejected(self) -> None:
+        """Glob in src is illegal when dest is explicit (1 src can't fan out to 1 dest)."""
+        import argparse
+
+        config = Config(profiles={'p': Profile(name='p', rw=[MountEntry(src='/host/foo-*.0', dest='/sandbox/x')])})
+        args = argparse.Namespace(
+            config=None,
+            profile='p',
+            no_default=False,
+            rw=[],
+            ro=[],
+            tmpfs=[],
+            bwargs=None,
+            set_env=[],
+            unset_env=[],
+            share_net=False,
+            share_user=False,
+            share_ipc=False,
+            share_pid=False,
+            share_uts=False,
+            dev_bind=False,
+            reuse_session=False,
+            debug=False,
+            debug_tmpfs=False,
+        )
+        with pytest.raises(ConfigError, match='glob is not allowed'):
+            build_runtime_config(config, args, ['echo'])
+
+    def test_dest_collision_dedup_is_deterministic(self) -> None:
+        """Two mounts with the same dest collapse to one; later in merge order wins."""
+        import argparse
+
+        # Profile has rw '/x' first then ro '/x' (different modes, same dest).
+        # Per OPTIONS order rw is processed before ro, so ro wins (later in
+        # the iteration). This is deterministic, not set-iteration-dependent.
+        config = Config(
+            profiles={
+                'p': Profile(
+                    name='p',
+                    rw=[MountEntry(src='/x', dest='/x')],
+                    ro=[MountEntry(src='/x', dest='/x')],
+                )
+            }
+        )
+        args = argparse.Namespace(
+            config=None,
+            profile='p',
+            no_default=False,
+            rw=[],
+            ro=[],
+            tmpfs=[],
+            bwargs=None,
+            set_env=[],
+            unset_env=[],
+            share_net=False,
+            share_user=False,
+            share_ipc=False,
+            share_pid=False,
+            share_uts=False,
+            dev_bind=False,
+            reuse_session=False,
+            debug=False,
+            debug_tmpfs=False,
+        )
+        runtime = build_runtime_config(config, args, ['echo'])
+        x_mounts = [m for m in runtime.mounts if m.dest == '/x']
+        assert len(x_mounts) == 1
+        assert x_mounts[0].mode == 'ro'
 
     def test_build_runtime_config_no_command_error(self) -> None:
         """Test error when no command provided."""

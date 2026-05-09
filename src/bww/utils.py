@@ -1,60 +1,66 @@
-"""Small utilities shared across the project (logging, formatting helpers)."""
+"""Logging via loguru."""
 
 from __future__ import annotations
 
 import sys
-from enum import Enum
+from typing import TYPE_CHECKING
+
+from loguru import logger
+
+if TYPE_CHECKING:
+    from loguru import Record
+
+__all__ = ['configure_logging', 'logger']
 
 
-class Color(Enum):
-    """ANSI color codes for terminal output."""
+# Short labels for loguru's default level names to keep terminal output terse.
+_LEVEL_ALIAS = {'WARNING': 'WARN', 'SUCCESS': 'OK'}
 
-    RESET = '\033[0m'
-    GRAY = '\033[90m'
-    RED = '\033[31m'
-    YELLOW = '\033[33m'
-    GREEN = '\033[32m'
-    CYAN = '\033[36m'
-    MAGENTA = '\033[35m'
+# Levels that go to stdout (pipe-friendly user-facing positive output).
+# Everything else (DEBUG, WARNING, ERROR, CRITICAL, TRACE) goes to stderr.
+_STDOUT_LEVELS = frozenset({'INFO', 'SUCCESS'})
 
 
-def error(msg: str) -> None:
-    """Print error message in red to stderr."""
-    print(f'{Color.RED.value}[ERROR]{Color.RESET.value} {msg}', file=sys.stderr)
+def _format(record: 'Record') -> str:
+    """Format callback: returns a loguru template string per-record.
+
+    Aliases WARNING → WARN, SUCCESS → OK so terminal output stays terse.
+    The trailing newline is required when using a callable format.
+    """
+    level_name = _LEVEL_ALIAS.get(record['level'].name, record['level'].name)
+    return f'<level>[{level_name}]</level> <level>{{message}}</level>\n'
 
 
-def warn(msg: str) -> None:
-    """Print warning message in yellow to stderr."""
-    print(f'{Color.YELLOW.value}[WARN]{Color.RESET.value} {msg}', file=sys.stderr)
+def configure_logging(debug: bool = False) -> None:
+    """Initialize loguru with two sinks: positive output → stdout, diagnostics → stderr.
 
+    Must be called explicitly (e.g. from main()). Until it runs, loguru's
+    default handler is in effect.
 
-def info(msg: str) -> None:
-    """Print info message in blue."""
-    print(f'\033[34m[INFO]{Color.RESET.value} {msg}')
+    Routing:
+      - stdout: INFO, SUCCESS (user-facing positive output)
+      - stderr: WARNING and above always; DEBUG when --debug is set
 
-
-def debug(msg: str, enabled: bool = True) -> None:
-    """Print debug message in gray (only if enabled)."""
-    if enabled:
-        print(f'{Color.GRAY.value}[DEBUG]{Color.RESET.value} {Color.GRAY.value}{msg}{Color.RESET.value}')
-
-
-def success(msg: str) -> None:
-    """Print success message in green."""
-    print(f'{Color.GREEN.value}[OK]{Color.RESET.value} {msg}')
-
-
-def command(msg: str) -> None:
-    """Print command message in gray."""
-    color = Color.GRAY.value
-    reset = Color.RESET.value
-
-    if '\n' not in msg:
-        print(f'{color}[CMD]{reset} {color}{msg}{reset}')
-        return
-
-    lines = msg.splitlines()
-    # Keep the prefix and the command on the same line (easy to read/copy).
-    print(f'{color}[CMD]{reset} {color}{lines[0]}{reset}')
-    for line in lines[1:]:
-        print(f'{color}{line}{reset}')
+    Also recolors DEBUG to dim/gray to match the historical look.
+    Idempotent — replaces any existing handlers, so it's safe to call from
+    main() or a test fixture.
+    """
+    logger.level('DEBUG', color='<dim>')
+    logger.remove()
+    logger.add(
+        sys.stdout,
+        format=_format,
+        colorize=True,
+        backtrace=False,
+        diagnose=False,
+        filter=lambda r: r['level'].name in _STDOUT_LEVELS,
+    )
+    logger.add(
+        sys.stderr,
+        level='DEBUG' if debug else 'WARNING',
+        format=_format,
+        colorize=True,
+        backtrace=False,
+        diagnose=False,
+        filter=lambda r: r['level'].name not in _STDOUT_LEVELS,
+    )

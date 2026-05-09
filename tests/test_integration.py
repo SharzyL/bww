@@ -99,25 +99,30 @@ class TestCLIParsing:
 
         code, stdout, stderr = run_bww('--dry-run', 'echo', 'hello')
         assert code == 0
-        assert '[CMD]' in stdout
         clean = _strip_ansi(stdout)
         assert 'bwrap' in clean
         assert '--chdir' in clean
         assert str(PROJECT_ROOT) in clean
-        # Executed binary is auto-mounted read-only.
+        # Executed binary's resolved target is auto-mounted read-only.
         resolved_echo = shutil.which('echo')
         if resolved_echo:
-            assert f'--ro-bind {resolved_echo} {resolved_echo}' in clean
+            target = str(Path(resolved_echo).resolve())
+            assert f'--ro-bind {target} {target}' in clean
         assert '--argv0 echo' in clean
         assert 'echo' in clean
 
-    def test_exe_ro_bind_skipped_when_dir_already_mounted(self) -> None:
-        """Test we don't add --ro-bind EXE EXE if a parent dir is already mounted."""
+    def test_exe_ro_bind_always_adds_target(self) -> None:
+        """The resolved exe target is unconditionally ro-bound, even when a parent
+        dir is already mounted. When the exe is a symlink and a bind ancestor is
+        present, no extra --symlink is emitted (the symlink is already exposed
+        via the parent bind).
+        """
         import shutil
 
         resolved = shutil.which('echo')
         if resolved is None:
             pytest.skip('echo not found in PATH')
+        target = str(Path(resolved).resolve())
 
         kdl_cfg = f"""
 profiles.p {{
@@ -130,7 +135,62 @@ profiles.p {{
             code, stdout, stderr = run_bww('--config', str(cfg), '-p', 'profiles.p', '--dry-run', 'echo', 'hi')
             assert code == 0
             clean = _strip_ansi(stdout)
-            assert f'--ro-bind {resolved} {resolved}' not in clean
+            assert f'--ro-bind {target} {target}' in clean
+            # Original symlink path covered by the parent ro-bind; no synthetic --symlink.
+            if resolved != target:
+                assert f'--symlink {target} {resolved}' not in clean
+
+    def test_exe_symlink_recreated_when_no_bind_ancestor(self) -> None:
+        """When the exe is a symlink and no ancestor is bind-mounted, we ro-bind
+        the target and emit `--symlink target exe` so the user-facing exe path
+        still resolves inside the sandbox.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            real_dir = Path(tmpdir) / 'real'
+            real_dir.mkdir()
+            real = real_dir / 'echo'
+            real.write_text('#!/bin/sh\necho "$@"\n')
+            real.chmod(0o755)
+
+            link_dir = Path(tmpdir) / 'links'
+            link_dir.mkdir()
+            link = link_dir / 'echo'
+            link.symlink_to(real)
+
+            code, stdout, stderr = run_bww('--dry-run', str(link), 'hi')
+            assert code == 0
+            clean = _strip_ansi(stdout)
+            assert f'--ro-bind {real} {real}' in clean
+            assert f'--symlink {real} {link}' in clean
+
+    def test_exe_symlink_not_recreated_when_bind_ancestor_present(self) -> None:
+        """When the exe is a symlink and a bind ancestor exposes it, we ro-bind
+        the resolved target only — emitting --symlink would EEXIST or EROFS.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            real_dir = Path(tmpdir) / 'real'
+            real_dir.mkdir()
+            real = real_dir / 'echo'
+            real.write_text('#!/bin/sh\necho "$@"\n')
+            real.chmod(0o755)
+
+            link_dir = Path(tmpdir) / 'links'
+            link_dir.mkdir()
+            link = link_dir / 'echo'
+            link.symlink_to(real)
+
+            kdl_cfg = f"""
+profiles.p {{
+  ro "{link_dir}"
+}}
+"""
+            cfg = Path(tmpdir) / 'config.kdl'
+            cfg.write_text(kdl_cfg)
+            code, stdout, stderr = run_bww('--config', str(cfg), '-p', 'profiles.p', '--dry-run', str(link), 'hi')
+            assert code == 0
+            clean = _strip_ansi(stdout)
+            assert f'--ro-bind {real} {real}' in clean
+            assert f'--symlink {real} {link}' not in clean
 
     def test_share_net_flag(self) -> None:
         """Test --share-net omits --unshare-net."""
@@ -183,10 +243,12 @@ profiles.p {{
         assert f'--bind {home}/.mozilla {home}/.mozilla' in clean
 
     def test_debug_flag(self) -> None:
-        """Test --debug shows command before execution."""
-        code, stdout, stderr = run_bww('--debug', '--dry-run', 'true')
-        assert code == 0
-        assert '[CMD]' in stdout
+        """--debug enables DEBUG-level logging on stderr."""
+        code, stdout, stderr = run_bww('--debug', 'true')
+        # bwrap may not exist or fail, but the debug log should always appear.
+        clean = _strip_ansi(stderr)
+        assert '[DEBUG]' in clean
+        assert 'running bwrap' in clean
 
     def test_cli_mount_rw(self) -> None:
         """Test --rw CLI argument."""
@@ -351,6 +413,57 @@ profiles.envp {
             assert '--setenv BWW_KEEP_X kept' in clean
             assert '--unsetenv BWW_KEEP_X' not in clean
             assert '--unsetenv BWW_KEEP_Y' in clean
+
+    def test_non_in_place_mount_in_dry_run(self) -> None:
+        """KDL 2-arg form produces `--bind SRC DEST` with distinct paths."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = Path(tmpdir) / 'config.kdl'
+            cfg.write_text(
+                """
+profiles.bind {
+  rw "/tmp/host-cache" "/sandbox-cache"
+}
+"""
+            )
+            code, stdout, stderr = run_bww('--config', str(cfg), '-p', 'bind', '--dry-run', 'echo')
+            assert code == 0, stderr
+            clean = _strip_ansi(stdout)
+            assert '--bind /tmp/host-cache /sandbox-cache' in clean
+
+    def test_unknown_kdl_key_warns(self) -> None:
+        """A typo in profile body emits [WARN] but doesn't fail the run."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = Path(tmpdir) / 'config.kdl'
+            cfg.write_text(
+                """
+profiles.p {
+  rw "/home"
+  setenv "FOO" "bar"   // typo: should be set-env
+}
+"""
+            )
+            code, stdout, stderr = run_bww('--config', str(cfg), '-p', 'p', '--dry-run', 'echo')
+            assert code == 0
+            assert '[WARN]' in stderr
+            assert 'setenv' in stderr
+            assert 'unknown key' in stderr.lower()
+
+    def test_unknown_top_level_key_warns(self) -> None:
+        """Unknown top-level KDL nodes emit [WARN] but don't fail."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = Path(tmpdir) / 'config.kdl'
+            cfg.write_text(
+                """
+flapdoodle "what"
+profiles.p {
+  rw "/home"
+}
+"""
+            )
+            code, stdout, stderr = run_bww('--config', str(cfg), '-p', 'p', '--dry-run', 'echo')
+            assert code == 0
+            assert '[WARN]' in stderr
+            assert 'flapdoodle' in stderr
 
     def test_no_default_flag(self) -> None:
         """Test --no-default flag prevents command defaults."""

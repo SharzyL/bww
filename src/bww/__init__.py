@@ -3,15 +3,19 @@
 import argparse
 import sys
 
-from .config import ConfigError, build_runtime_config, load_config, validate_config
-from .options import BOOL_OPTIONS
+from .dispatch import add_cli_arg
+from .loader import load_config
+from .models import ConfigError
+from .options import OPTIONS
+from .runtime import build_runtime_config, validate_config
 from .executor import (
     ExecutionError,
     build_bwrap_command,
     execute_bwrap,
     format_bwrap_command,
+    to_argv,
 )
-from .utils import command, error, success, warn
+from .utils import configure_logging, logger
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -42,65 +46,11 @@ def create_parser() -> argparse.ArgumentParser:
         help='Do not load [defaults.COMMAND] section',
     )
 
-    parser.add_argument(
-        '--rw',
-        action='append',
-        default=[],
-        metavar='PATH',
-        dest='rw',
-        help='Read-write mount (can be repeated)',
-    )
-
-    parser.add_argument(
-        '--ro',
-        action='append',
-        default=[],
-        metavar='PATH',
-        dest='ro',
-        help='Read-only mount (can be repeated)',
-    )
-
-    parser.add_argument(
-        '--tmpfs',
-        action='append',
-        default=[],
-        metavar='PATH',
-        dest='tmpfs',
-        help='Tmpfs mount (can be repeated)',
-    )
-
-    parser.add_argument(
-        '--bwargs',
-        metavar='ARGS',
-        help='Extra bwrap arguments (space-separated string)',
-    )
-
-    parser.add_argument(
-        '--set-env',
-        action='append',
-        default=[],
-        metavar='KEY=VALUE',
-        dest='set_env',
-        help='Set env var inside sandbox (repeatable). VALUE supports ${VAR} expansion',
-    )
-
-    parser.add_argument(
-        '--unset-env',
-        action='append',
-        default=[],
-        metavar='PATTERN',
-        dest='unset_env',
-        help='Unset env vars matching PATTERN inside sandbox (repeatable). Supports glob '
-        'wildcards (*, ?, [abc]) and ${VAR} expansion',
-    )
-
-    for opt in BOOL_OPTIONS:
-        parser.add_argument(
-            opt.cli_flag,
-            action='store_true',
-            dest=opt.dest,
-            help=opt.help,
-        )
+    # All per-profile options come from the OPTIONS registry — argparse setup
+    # is dispatcher-driven, so adding a new option of a known kind is just a
+    # registry entry plus the matching dataclass fields.
+    for spec in OPTIONS:
+        add_cli_arg(parser, spec)
 
     parser.add_argument(
         '--debug',
@@ -142,6 +92,7 @@ def main() -> None:
     try:
         parser = create_parser()
         args = parser.parse_args()
+        configure_logging(debug=bool(args.debug))
 
         # ====================================================================
         # Handle --validate: Check config validity and exit
@@ -149,7 +100,7 @@ def main() -> None:
         if args.validate:
             config = load_config(args.config)
             validate_config(config)
-            success('Configuration is valid')
+            logger.success('Configuration is valid')
             return
 
         # ====================================================================
@@ -162,43 +113,37 @@ def main() -> None:
 
         # Check command provided
         if not args.command:
-            error('No command specified')
+            logger.error('No command specified')
             sys.exit(1)
 
         # Build runtime configuration
         runtime = build_runtime_config(config, args, args.command)
 
-        # Build bwrap command
-        bwrap_cmd = build_bwrap_command(runtime)
+        # Build bwrap command (as token groups; flatten only for exec)
+        bwrap_groups = build_bwrap_command(runtime)
+        formatted = format_bwrap_command(bwrap_groups)
 
-        # ====================================================================
-        # Handle --dry-run: Show what would run without executing
-        # ====================================================================
+        # --dry-run: print the bwrap command and exit (primary program output;
+        # plain stdout, no log prefix, so it's pipeable).
         if args.dry_run:
-            command(format_bwrap_command(bwrap_cmd))
+            print(formatted)
             return
 
-        # ====================================================================
-        # Debug output: Show command being executed
-        # ====================================================================
-        if args.debug:
-            command(format_bwrap_command(bwrap_cmd))
+        # --debug: log the bwrap command before exec.
+        logger.debug(f'running bwrap:\n{formatted}')
 
-        # ====================================================================
-        # Execute bwrap
-        # ====================================================================
-        exit_code = execute_bwrap(bwrap_cmd, args.debug_tmpfs)
+        exit_code = execute_bwrap(to_argv(bwrap_groups), args.debug_tmpfs)
         sys.exit(exit_code)
 
     except ConfigError as e:
-        error(f'Configuration error: {e}')
+        logger.error(f'Configuration error: {e}')
         sys.exit(1)
     except ExecutionError as e:
-        error(f'Execution error: {e}')
+        logger.error(f'Execution error: {e}')
         sys.exit(2)
     except KeyboardInterrupt:
-        warn('Interrupted by user')
+        logger.warning('Interrupted by user')
         sys.exit(130)
     except Exception as e:
-        error(f'Unexpected error: {e}')
+        logger.error(f'Unexpected error: {e}')
         sys.exit(3)

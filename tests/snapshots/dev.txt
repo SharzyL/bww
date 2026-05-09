@@ -1,0 +1,15 @@
+bwrap --unshare-user --unshare-ipc --unshare-pid --unshare-net --unshare-uts --unshare-cgroup --die-with-parent --new-session \
+  --dev /dev \
+  --proc /proc \
+  --tmpfs /tmp \
+  --tmpfs /home/sharzy \
+  --ro-bind /etc/static /etc/static \
+  --ro-bind /nix/store /nix/store \
+  --ro-bind /nix/store/jjxngswsb214vb58qx485jhmilf0kxxy-coreutils-9.10/bin/coreutils /nix/store/jjxngswsb214vb58qx485jhmilf0kxxy-coreutils-9.10/bin/coreutils \
+  --bind /home/sharzy/ws/dev/proj/python/bww /home/sharzy/ws/dev/proj/python/bww \
+  --unsetenv SSH_ASKPASS \
+  --unsetenv SSH_AUTH_SOCK \
+  --setenv PATH /run/current-system/sw/bin:/home/sharzy/.local/bin \
+  --chdir /home/sharzy/ws/dev/proj/python/bww \
+  --argv0 echo \
+  -- /nix/store/jjxngswsb214vb58qx485jhmilf0kxxy-coreutils-9.10/bin/echo hi
