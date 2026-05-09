@@ -106,10 +106,15 @@ def _emit_option(spec: OptionSpec, runtime: 'RuntimeConfig') -> BwrapGroups:
 
 
 def _emit_mounts(runtime: 'RuntimeConfig') -> BwrapGroups:
-    """Emit mount groups, sorted tmpfs → ro → rw (then by dest)."""
-    mode_order = {'tmpfs': 0, 'ro': 1, 'rw': 2}
+    """Emit mount groups in dest lexicographic order — a valid topological
+    order for the parent-before-child constraint on normalized paths.
+
+    Mode is no longer part of the sort key: when a tree mixes modes (e.g.
+    `rw /etc` + `ro /etc/foo`), parent must still come first so the child's
+    override isn't shadowed by a later parent bind.
+    """
     out: BwrapGroups = []
-    for m in sorted(runtime.mounts, key=lambda m: (mode_order.get(m.mode, 99), m.dest)):
+    for m in sorted(runtime.mounts, key=lambda m: m.dest):
         if m.mode == 'tmpfs':
             out.append(['--tmpfs', m.dest])
         elif m.mode == 'rw':

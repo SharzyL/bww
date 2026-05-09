@@ -32,6 +32,8 @@ def load_config(config_override: str | None = None) -> Config:
     if not config_path.exists():
         return Config()
 
+    logger.debug(f'use config from {config_path}')
+
     try:
         text = config_path.read_text(encoding='utf-8')
         doc = kdl.parse(text)

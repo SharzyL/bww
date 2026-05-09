@@ -23,9 +23,11 @@ from .utils import logger
 
 __all__ = [
     'add_cli_arg',
+    'elide_redundant_inplace',
     'merge_profile',
     'read_kdl_option',
     'resolve_env_directives',
+    'resolve_symlink_srcs',
 ]
 
 
@@ -253,6 +255,97 @@ def build_mounts(merged: Profile, config_dir: Path) -> dict[str, Mount]:
     for m in expanded:
         by_dest[m.dest] = m
     return by_dest
+
+
+def _walk_symlink_chain(start: Path) -> tuple[Path, list[tuple[Path, Path]]]:
+    """Walk a host symlink chain one hop at a time.
+
+    Returns (final_resolved_path, [(link, hop_target), ...]) where each
+    `(link, hop_target)` mirrors one host symlink hop. `hop_target` is the
+    readlink content made absolute against `link.parent` if relative, with
+    `..`/`.` collapsed but no further symlink resolution applied — that way
+    the chain in the sandbox preserves the host's intermediate structure.
+    Raises ConfigError on a symlink loop.
+    """
+    chain: list[tuple[Path, Path]] = []
+    cur = start
+    seen: set[str] = set()
+    while cur.is_symlink():
+        key = str(cur)
+        if key in seen:
+            raise ConfigError(f'symlink loop while resolving {start}: revisited {key}')
+        seen.add(key)
+        raw = os.readlink(cur)
+        nxt_raw = Path(raw) if raw.startswith('/') else cur.parent / raw
+        nxt = Path(os.path.normpath(nxt_raw))
+        chain.append((cur, nxt))
+        cur = nxt
+    return cur, chain
+
+
+def resolve_symlink_srcs(by_dest: dict[str, Mount]) -> tuple[dict[str, Mount], list[tuple[str, str]]]:
+    """Rewrite in-place mounts whose src is a symlink: ro/rw-bind the final
+    resolved target, and emit one pending `--symlink hop_target link` per
+    host symlink hop so the sandbox preserves the entire chain — not just
+    the final destination.
+
+    Non-in-place, tmpfs, and non-symlink mounts pass through unchanged.
+    Returns (rewritten by_dest, list of pending (target, link) symlinks).
+    """
+    out: dict[str, Mount] = {}
+    pending: list[tuple[str, str]] = []
+    for dest, m in by_dest.items():
+        if m.src is None or m.src != m.dest or not Path(m.src).is_symlink():
+            out[dest] = m
+            continue
+        final, chain = _walk_symlink_chain(Path(m.src))
+        out[str(final)] = Mount(src=str(final), dest=str(final), mode=m.mode)
+        for link, hop_target in chain:
+            pending.append((str(hop_target), str(link)))
+        chain_str = ' -> '.join([m.src, *(str(t) for _, t in chain)])
+        logger.debug(f'resolve symlink {chain_str} (bind {final}, defer {len(chain)} --symlink)')
+    return out, pending
+
+
+def _inplace_covering_ancestor(m: Mount, by_dest: dict[str, Mount]) -> Mount | None:
+    """Return the nearest ancestor in `by_dest` that makes `m` redundant.
+
+    Redundant ⇔ both `m` and the nearest ancestor are in-place binds of the
+    same mode. Non-in-place children, tmpfs children, and children whose
+    nearest ancestor differs in mode (deliberate override) or geometry
+    (non-in-place ancestor) are kept. Walks only to the nearest ancestor;
+    further-up ancestors are shadowed locally and don't establish coverage.
+    """
+    if m.src is None or m.src != m.dest:
+        return None
+    p = Path(m.dest).parent
+    while True:
+        anc = by_dest.get(str(p))
+        if anc is not None:
+            if anc.src is not None and anc.src == anc.dest and anc.mode == m.mode:
+                return anc
+            return None
+        if p == p.parent:
+            return None
+        p = p.parent
+
+
+def elide_redundant_inplace(by_dest: dict[str, Mount]) -> dict[str, Mount]:
+    """Drop in-place children whose nearest ancestor is a same-mode in-place
+    bind — the child mount would be a no-op vs. the ancestor's coverage.
+
+    Iterates dest-sorted so each decision sees its parent already committed
+    to `out` (parents come before children in lex order on normalized paths).
+    """
+    out: dict[str, Mount] = {}
+    for dest in sorted(by_dest):
+        m = by_dest[dest]
+        anc = _inplace_covering_ancestor(m, out)
+        if anc is not None:
+            logger.debug(f'elide {m.mode} {m.dest} (covered by {anc.dest})')
+            continue
+        out[dest] = m
+    return out
 
 
 def resolve_env_directives(

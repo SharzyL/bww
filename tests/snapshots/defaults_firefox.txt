@@ -2,29 +2,28 @@ bwrap --unshare-user --unshare-ipc --unshare-pid --unshare-net --unshare-uts --u
   --dev-bind /dev /dev \
   --proc /proc \
   --tmpfs /tmp \
-  --tmpfs /home/sharzy \
   --ro-bind /etc/alsa /etc/alsa \
-  --ro-bind /etc/dbus-1 /etc/dbus-1 \
-  --ro-bind /etc/fonts /etc/fonts \
   --ro-bind /etc/resolv.conf /etc/resolv.conf.host \
-  --ro-bind /etc/static /etc/static \
+  --tmpfs /home/sharzy \
+  --bind /home/sharzy/.cache/fontconfig /home/sharzy/.cache/fontconfig \
   --ro-bind /home/sharzy/.config/glib-2.0 /home/sharzy/.config/glib-2.0 \
   --ro-bind /home/sharzy/.config/gtk-2.0 /home/sharzy/.config/gtk-2.0 \
   --ro-bind /home/sharzy/.config/gtk-3.0 /home/sharzy/.config/gtk-3.0 \
   --ro-bind /home/sharzy/.config/gtk-4.0 /home/sharzy/.config/gtk-4.0 \
-  --ro-bind /home/sharzy/.config/mimeapps.list /home/sharzy/.config/mimeapps.list \
   --ro-bind /home/sharzy/.local/share/fonts /home/sharzy/.local/share/fonts \
   --ro-bind /home/sharzy/.local/share/icons /home/sharzy/.local/share/icons \
   --ro-bind /home/sharzy/.local/state/nix/profile/share/fonts /home/sharzy/.local/state/nix/profile/share/fonts \
-  --ro-bind /nix/store /nix/store \
-  --ro-bind /nix/store/jjxngswsb214vb58qx485jhmilf0kxxy-coreutils-9.10/bin/coreutils /nix/store/jjxngswsb214vb58qx485jhmilf0kxxy-coreutils-9.10/bin/coreutils \
-  --ro-bind /run/opengl-driver /run/opengl-driver \
-  --ro-bind /sys /sys \
-  --bind /home/sharzy/.cache/fontconfig /home/sharzy/.cache/fontconfig \
   --bind /home/sharzy/.mozilla /home/sharzy/.mozilla \
   --bind /home/sharzy/ws/dev/proj/python/bww /home/sharzy/ws/dev/proj/python/bww \
+  --ro-bind /nix/store /nix/store \
   --bind /run/dbus /run/dbus \
   --bind /run/user/1000 /run/user/1000 \
+  --ro-bind /sys /sys \
+  --symlink /etc/static/dbus-1 /etc/dbus-1 \
+  --symlink /etc/static/fonts /etc/fonts \
+  --symlink /nix/store/qv0zc2j0hg943xfi3g2vr4nyf1k5ycx6-etc/etc /etc/static \
+  --symlink /nix/store/8a93hqa9rxmj2snn3jchgr0k8sxw2bfm-home-manager-files/.config/mimeapps.list /home/sharzy/.config/mimeapps.list \
+  --symlink /nix/store/xj07xg9vzyn59vnv768lcvvkg8avsba1-graphics-drivers /run/opengl-driver \
   --chdir /home/sharzy/ws/dev/proj/python/bww \
   --argv0 echo \
   -- /nix/store/jjxngswsb214vb58qx485jhmilf0kxxy-coreutils-9.10/bin/echo hi

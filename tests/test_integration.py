@@ -5,8 +5,6 @@ import sys
 import tempfile
 from pathlib import Path
 
-import pytest
-
 
 # Find project root (directory containing pyproject.toml)
 def _get_project_root() -> Path:
@@ -111,34 +109,153 @@ class TestCLIParsing:
         assert '--argv0 echo' in clean
         assert 'echo' in clean
 
-    def test_exe_ro_bind_always_adds_target(self) -> None:
-        """The resolved exe target is unconditionally ro-bound, even when a parent
-        dir is already mounted. When the exe is a symlink and a bind ancestor is
-        present, no extra --symlink is emitted (the symlink is already exposed
-        via the parent bind).
+    def test_exe_ro_bind_elided_when_target_ancestor_in_place_ro(self) -> None:
+        """When the resolved exe target sits under an in-place ro bind ancestor,
+        the auto target ro-bind is elided as redundant.
         """
-        import shutil
+        with tempfile.TemporaryDirectory() as tmpdir:
+            real_dir = Path(tmpdir) / 'real'
+            real_dir.mkdir()
+            real = real_dir / 'echo'
+            real.write_text('#!/bin/sh\necho "$@"\n')
+            real.chmod(0o755)
 
-        resolved = shutil.which('echo')
-        if resolved is None:
-            pytest.skip('echo not found in PATH')
-        target = str(Path(resolved).resolve())
-
-        kdl_cfg = f"""
+            kdl_cfg = f"""
 profiles.p {{
-  ro "{Path(resolved).parent}"
+  ro "{real_dir}"
 }}
+"""
+            cfg = Path(tmpdir) / 'config.kdl'
+            cfg.write_text(kdl_cfg)
+            code, stdout, stderr = run_bww('--config', str(cfg), '-p', 'profiles.p', '--dry-run', str(real), 'hi')
+            assert code == 0
+            clean = _strip_ansi(stdout)
+            assert f'--ro-bind {real_dir} {real_dir}' in clean
+            assert f'--ro-bind {real} {real}' not in clean
+
+    def test_redundant_inplace_child_ro_elided(self) -> None:
+        """An in-place ro child whose nearest ancestor is an in-place ro bind is
+        elided — the parent bind already exposes the child path.
+        """
+        kdl_cfg = """
+profiles.p {
+  ro "/etc"
+  ro "/etc/hosts"
+}
 """
         with tempfile.TemporaryDirectory() as tmpdir:
             cfg = Path(tmpdir) / 'config.kdl'
             cfg.write_text(kdl_cfg)
-            code, stdout, stderr = run_bww('--config', str(cfg), '-p', 'profiles.p', '--dry-run', 'echo', 'hi')
+            code, stdout, stderr = run_bww('--config', str(cfg), '-p', 'profiles.p', '--dry-run', 'echo')
             assert code == 0
             clean = _strip_ansi(stdout)
-            assert f'--ro-bind {target} {target}' in clean
-            # Original symlink path covered by the parent ro-bind; no synthetic --symlink.
-            if resolved != target:
-                assert f'--symlink {target} {resolved}' not in clean
+            assert '--ro-bind /etc /etc' in clean
+            assert '--ro-bind /etc/hosts /etc/hosts' not in clean
+
+    def test_inplace_child_kept_when_parent_mode_differs(self) -> None:
+        """Cross-mode parent + child are both kept; lex sort on dest puts the
+        parent before the child so the child override isn't shadowed by a
+        later parent bind.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            parent = Path(tmpdir) / 'parent'
+            parent.mkdir()
+            child = parent / 'inner'
+            child.mkdir()
+
+            kdl_cfg = f"""
+profiles.p {{
+  rw "{parent}"
+  ro "{child}"
+}}
+"""
+            cfg = Path(tmpdir) / 'config.kdl'
+            cfg.write_text(kdl_cfg)
+            code, stdout, stderr = run_bww('--config', str(cfg), '-p', 'profiles.p', '--dry-run', 'echo')
+            assert code == 0
+            clean = _strip_ansi(stdout)
+            assert f'--bind {parent} {parent}' in clean
+            assert f'--ro-bind {child} {child}' in clean
+            # Parent must precede child in argv (otherwise the rw would shadow the ro override).
+            assert clean.index(f'--bind {parent} {parent}') < clean.index(f'--ro-bind {child} {child}')
+
+    def test_symlink_src_rewritten_to_target_bind_plus_symlink(self) -> None:
+        """An in-place mount whose src is a host symlink is rewritten: the
+        resolved target gets ro/rw-bound at the target path, and a `--symlink
+        target original` is emitted so the sandbox preserves the symlink at
+        the original path.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            real_dir = Path(tmpdir) / 'real-bin'
+            real_dir.mkdir()
+            link = Path(tmpdir) / 'link-bin'
+            link.symlink_to(real_dir)
+
+            kdl_cfg = f"""
+profiles.p {{
+  ro "{link}"
+}}
+"""
+            cfg = Path(tmpdir) / 'config.kdl'
+            cfg.write_text(kdl_cfg)
+            code, stdout, stderr = run_bww('--config', str(cfg), '-p', 'profiles.p', '--dry-run', 'echo')
+            assert code == 0
+            clean = _strip_ansi(stdout)
+            assert f'--ro-bind {real_dir} {real_dir}' in clean
+            assert f'--symlink {real_dir} {link}' in clean
+            # The original symlink path should NOT be bound directly.
+            assert f'--ro-bind {link} {link}' not in clean
+
+    def test_symlink_src_skipped_when_bind_ancestor_present(self) -> None:
+        """When the original symlink path has a bind ancestor, the synthetic
+        --symlink would EEXIST (the host symlink is exposed via the parent
+        bind), so it's skipped. The resolved-target bind still goes through.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            real_dir = Path(tmpdir) / 'real-bin'
+            real_dir.mkdir()
+            parent_dir = Path(tmpdir) / 'links'
+            parent_dir.mkdir()
+            link = parent_dir / 'link-bin'
+            link.symlink_to(real_dir)
+
+            kdl_cfg = f"""
+profiles.p {{
+  ro "{parent_dir}"
+  ro "{link}"
+}}
+"""
+            cfg = Path(tmpdir) / 'config.kdl'
+            cfg.write_text(kdl_cfg)
+            code, stdout, stderr = run_bww('--config', str(cfg), '-p', 'profiles.p', '--dry-run', 'echo')
+            assert code == 0
+            clean = _strip_ansi(stdout)
+            assert f'--ro-bind {parent_dir} {parent_dir}' in clean
+            assert f'--symlink {real_dir} {link}' not in clean
+
+    def test_inplace_child_kept_when_ancestor_is_tmpfs(self) -> None:
+        """A tmpfs ancestor doesn't elide an in-place bind child — the tmpfs
+        starts empty and the child mount paints content into it.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_root = Path(tmpdir) / 'root'
+            tmp_root.mkdir()
+            inner = tmp_root / 'inner'
+            inner.mkdir()
+
+            kdl_cfg = f"""
+profiles.p {{
+  tmpfs "{tmp_root}"
+  rw "{inner}"
+}}
+"""
+            cfg = Path(tmpdir) / 'config.kdl'
+            cfg.write_text(kdl_cfg)
+            code, stdout, stderr = run_bww('--config', str(cfg), '-p', 'profiles.p', '--dry-run', 'echo')
+            assert code == 0
+            clean = _strip_ansi(stdout)
+            assert f'--tmpfs {tmp_root}' in clean
+            assert f'--bind {inner} {inner}' in clean
 
     def test_exe_symlink_recreated_when_no_bind_ancestor(self) -> None:
         """When the exe is a symlink and no ancestor is bind-mounted, we ro-bind

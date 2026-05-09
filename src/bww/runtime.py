@@ -15,7 +15,14 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from .dispatch import build_mounts, from_cli, merge_profile, resolve_env_directives
+from .dispatch import (
+    build_mounts,
+    elide_redundant_inplace,
+    from_cli,
+    merge_profile,
+    resolve_env_directives,
+    resolve_symlink_srcs,
+)
 from .expand import expand_path, get_config_path
 from .models import Config, ConfigError, Mount, Profile, RuntimeConfig
 from .options import OPTIONS
@@ -163,6 +170,14 @@ def build_runtime_config(config: Config, args: argparse.Namespace, command: list
     # 4. Build mounts (dest-keyed deterministic dedup; sees all mount-kind specs).
     by_dest = build_mounts(merged_profile, config_dir)
 
+    # 4b. Rewrite mounts whose src is a host symlink: bind the resolved target
+    # (so the actual content is reachable without DEST-side symlink traversal
+    # at bwrap setup time), and remember a pending `--symlink target original`
+    # so the sandbox preserves the symlink at its original path. Decision to
+    # actually emit the --symlink is deferred until after elision (step 7c)
+    # because a bind ancestor on the original path makes it redundant.
+    by_dest, user_pending_symlinks = resolve_symlink_srcs(by_dest)
+
     # 5. Resolve the executable.
     expanded_command = list(command)
     exe = expanded_command[0]
@@ -175,19 +190,12 @@ def build_runtime_config(config: Config, args: argparse.Namespace, command: list
 
     # 6. Auto-mount the exe so it stays runnable inside the sandbox.
     #
-    # We always ro-bind the *resolved* target (following any symlink chain),
-    # because that is what bwrap actually has to exec. If the exe itself is a
-    # symlink, we additionally have to make the user-facing exe path resolve
-    # inside the sandbox:
-    #   - If a bind ancestor (rw/ro) is already in `by_dest`, the host
-    #     symlink is naturally exposed via that bind — no extra work needed.
-    #     Emitting --symlink would EEXIST, and binding the symlink path
-    #     directly would EROFS / fail the symlink-target walk inside the
-    #     in-progress sandbox ns.
-    #   - Otherwise the exe path doesn't exist in the sandbox at all, so we
-    #     emit `--symlink target exe` and let bwrap create the link plus any
-    #     intermediate dirs (always safe because we order --symlink after
-    #     all mounts, so any tmpfs ancestor is in place and writable).
+    # We always ro-bind the resolved target (following any symlink chain) —
+    # that is what bwrap actually has to exec. If the exe is itself a
+    # symlink, we register a pending `--symlink target exe` so the
+    # user-facing exe path stays valid inside the sandbox; the final emit
+    # decision is made in step 7c, which knows about both bind and planned
+    # symlink ancestors.
     exe_path = str(Path(expanded_command[0]).absolute())
     target_path = str(Path(expanded_command[0]).resolve())
     by_dest[target_path] = Mount(src=target_path, dest=target_path, mode='ro')
@@ -196,17 +204,9 @@ def build_runtime_config(config: Config, args: argparse.Namespace, command: list
     else:
         logger.debug(f'auto ro-bind exe target: {target_path} (resolved from symlink {exe_path})')
 
-    symlinks: list[tuple[str, str]] = []
+    exe_pending_symlinks: list[tuple[str, str]] = []
     if exe_path != target_path:
-        ancestor = _bind_ancestor_for(exe_path, by_dest)
-        if ancestor is not None:
-            logger.debug(
-                f'skip --symlink for exe {exe_path}: '
-                f'already exposed via bind ancestor {ancestor.dest!r} ({ancestor.mode})'
-            )
-        else:
-            symlinks.append((target_path, exe_path))
-            logger.debug(f'auto --symlink {target_path} -> {exe_path} (no bind ancestor; recreate in sandbox)')
+        exe_pending_symlinks.append((target_path, exe_path))
 
     # 7. share-net: libc name resolution typically relies on /etc/* files.
     # Mount them read-only if present, without overriding explicit user mounts.
@@ -217,6 +217,29 @@ def build_runtime_config(config: Config, args: argparse.Namespace, command: list
             if Path(etc_path).exists():
                 by_dest[etc_path] = Mount(src=etc_path, dest=etc_path, mode='ro')
                 logger.debug(f'auto ro-bind for share-net: {etc_path}')
+
+    # 7b. Drop in-place children covered by an in-place same-mode ancestor.
+    # The auto exe ro-bind, share-net /etc files, and user mounts are all
+    # registered by now — the elision pass sees the full picture.
+    by_dest = elide_redundant_inplace(by_dest)
+
+    # 7c. Decide which pending symlinks to actually emit. A symlink at `link`
+    # is skipped when an ancestor of `link` is already a bind (rw/ro) or an
+    # earlier planned symlink — bwrap would EEXIST against an exposed host
+    # symlink or EROFS against a read-only ancestor. Tmpfs ancestors do not
+    # block (they're writable; bwrap will create the link + intermediate
+    # dirs). Sort by `link` so parents are decided first; that way a parent
+    # symlink we keep correctly blocks any descendant.
+    exe_pending_set = set(exe_pending_symlinks)
+    symlinks: list[tuple[str, str]] = []
+    for target, link in sorted(exe_pending_symlinks + user_pending_symlinks, key=lambda s: s[1]):
+        origin = 'exe' if (target, link) in exe_pending_set else 'user mount'
+        blocker = _symlink_blocker(link, by_dest, symlinks)
+        if blocker is not None:
+            logger.debug(f'skip symlink for {link} ({origin}, would resolve to {target}): covered by {blocker}')
+            continue
+        symlinks.append((target, link))
+        logger.debug(f'emit symlink for {link} ({origin}) -> {target}')
 
     # 8. Resolve env directives (set-env wins on overlap with unset-env patterns).
     resolved_set_env, resolved_unset_env = resolve_env_directives(
@@ -247,18 +270,28 @@ def build_runtime_config(config: Config, args: argparse.Namespace, command: list
     return RuntimeConfig(**kwargs)
 
 
-def _bind_ancestor_for(path: str, by_dest: dict[str, Mount]) -> Mount | None:
-    """Return the nearest bind (rw/ro) mount whose dest is an ancestor of `path`.
+def _symlink_blocker(
+    link: str,
+    by_dest: dict[str, Mount],
+    planned_symlinks: list[tuple[str, str]],
+) -> str | None:
+    """Return a description of the nearest covering ancestor of `link` that
+    would prevent emitting `--symlink ... {link}`, or None if it's safe.
 
-    Tmpfs ancestors don't count: a tmpfs ancestor doesn't expose host content,
-    so the symlink at `path` won't naturally appear inside the sandbox and we
-    still need to materialize it via --symlink.
+    Bind ancestors (rw/ro): the host symlink at `link` is already exposed via
+    that bind, so a `--symlink` there would EEXIST or EROFS. Earlier planned
+    symlinks at an ancestor: the path walk would cross through that symlink
+    into a read-only target. Tmpfs ancestors don't block — bwrap creates
+    intermediate dirs inside the writable tmpfs.
     """
-    p = Path(path).parent
+    planned_link_paths = {pl for _, pl in planned_symlinks}
+    p = Path(link).parent
     while True:
-        m = by_dest.get(str(p))
-        if m is not None and m.mode in ('rw', 'ro'):
-            return m
+        if str(p) in planned_link_paths:
+            return f'planned --symlink at {p}'
+        anc = by_dest.get(str(p))
+        if anc is not None and anc.src is not None:  # rw or ro bind (tmpfs has src=None)
+            return f'{anc.mode} bind {anc.dest!r}'
         if p == p.parent:
             return None
         p = p.parent
