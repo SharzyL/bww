@@ -33,13 +33,28 @@ defaults.python-dev {
 }
 ```
 
+Mount entries take 1 or 2 path arguments:
+
+- `rw "/host"` is in-place (host path = sandbox path).
+- `rw "/host" "/sandbox"` is non-in-place (different src and dest).
+- `tmpfs "/path"` has no src; 2-arg form is rejected.
+
+In-place binds may use globs (`*`, `?`, `[abc]`) on the src path; explicit-dest binds may not.
+
+When an in-place mount's src is a host symlink, bww follows the chain hop-by-hop, binds the final
+resolved target, and emits one `--symlink` per host hop — preserving the symlink structure inside
+the sandbox rather than collapsing it. In-place children covered by a same-mode in-place ancestor
+are elided automatically (e.g. `ro /etc + ro /etc/hosts` emits only `--ro-bind /etc /etc`).
+
 ### Path Variables
 
 Command (exec) paths support both shell-style and systemd-style expansion when you pass a path-like command
 (e.g. `./script`, `~/bin/tool`, `%h/bin/tool`). Mount paths also support this expansion.
 If you pass a bare command like `chromium`, bww resolves it via `PATH` (like `which chromium`) and passes the
 absolute executable path to `bwrap`.
-The resolved executable is also auto-mounted read-only (`--ro-bind EXE EXE`).
+The exe's resolved target is auto ro-bound; if the exe path is itself a host symlink, bww also emits a `--symlink`
+so the user-facing exe path keeps working inside the sandbox (skipped automatically when a bind ancestor or
+another planned symlink already exposes it).
 
 - `${ENV_NAME}` - Environment variable expansion
 - `~` - User home directory (shell-style, only at path start like `~/dir`)
@@ -142,13 +157,14 @@ $ uv run pytest tests/test_config.py -v
 $ uv run pytest tests/test_integration.py -v
 ```
 
-### Type Checking
+### Type Checking and Lint
 
 ```console
-# Fast type checking with ty
-$ ty check
+# Lint + type check
+$ uv run ruff check src/bww tests
+$ uv run basedpyright
 
-# Full check with nix
+# Full check with nix (build + tests + treefmt)
 $ nix flake check
 ```
 
@@ -156,35 +172,15 @@ $ nix flake check
 
 ```console
 # Format Python code
-$ ruff format src/bww tests
+$ uv run ruff format src/bww tests
 
 # Format Nix files
 $ nix fmt
 ```
 
-### Project Structure
+### Snapshots
 
-```
-src/bww/
-├── __init__.py       # Main entry point, CLI parsing
-├── __main__.py       # Module entry point
-├── config.py         # Configuration loading, validation, specifier expansion
-└── executor.py       # Logging, mount resolution, bwrap execution
-
-tests/
-├── test_config.py    # Unit tests for configuration
-└── test_integration.py  # Integration tests for CLI
-
-example/
-└── config.kdl       # Example configuration file
-```
-
-### Architecture
-
-**Three core modules:**
-
-1. **executor.py** - ANSI colorful logging, mount resolution, bwrap command building
-2. **config.py** - KDL parsing, profile inheritance, path expansion, validation
-3. **__init__.py** - CLI argument parsing, control flow, exception handling
-
-**Minimal dependencies** - Uses Python 3.12+ stdlib plus `kdl-py` for config parsing
+`tests/snapshots/` captures byte-exact `bww --dry-run` output for `dev`,
+`defaults.firefox`, and `defaults.chromium` profiles. Run
+`bash tests/snapshots/check.sh` to diff the current output against the
+saved snapshots after a change.
