@@ -1,11 +1,14 @@
 """Execution layer: bubblewrap command building and execution."""
 
+import json
 import os
 import shlex
 import subprocess
+import threading
 from typing import TYPE_CHECKING
 
 from .options import OPTIONS, OptionSpec
+from .utils import logger
 
 if TYPE_CHECKING:
     from .models import RuntimeConfig
@@ -136,13 +139,30 @@ def build_bwrap_command(runtime_config: 'RuntimeConfig') -> BwrapGroups:
     """
     groups: BwrapGroups = [['bwrap']]
 
+    # Collapse the unshare prelude to `--unshare-all` (plus a trailing
+    # `--share-net` if network access is desired) whenever none of the
+    # non-net share-* overrides are active. bwrap only ships `--share-net`
+    # — there is no `--share-user`/`--share-ipc`/etc — so any of those
+    # forces a fall-back to per-flag emission.
+    non_net_shares = (
+        runtime_config.share_user or runtime_config.share_ipc or runtime_config.share_pid or runtime_config.share_uts
+    )
+    use_unshare_all = not non_net_shares
+    _share_keys = {'share-net', 'share-user', 'share-ipc', 'share-pid', 'share-uts'}
+
     # Iterate OPTIONS in registry order. Static separators are inserted at
     # well-defined points to keep the bwrap argv layout stable.
     for spec in OPTIONS:
-        groups.extend(_emit_option(spec, runtime_config))
+        if not (use_unshare_all and spec.key in _share_keys):
+            groups.extend(_emit_option(spec, runtime_config))
         if spec.key == 'share-uts':
-            # After all unshare-* flags, before the rest of the prelude.
-            groups.append(['--unshare-cgroup'])
+            # End of the unshare prelude. --unshare-all already covers cgroup.
+            if use_unshare_all:
+                groups.append(['--unshare-all'])
+                if runtime_config.share_net:
+                    groups.append(['--share-net'])
+            else:
+                groups.append(['--unshare-cgroup'])
             groups.append(['--die-with-parent'])
         elif spec.key == 'dev-bind':
             # After the /dev decision, before configured mounts.
@@ -165,11 +185,65 @@ def build_bwrap_command(runtime_config: 'RuntimeConfig') -> BwrapGroups:
     return groups
 
 
-def execute_bwrap(cmd: list[str], debug_tmpfs: bool) -> int:
-    """Execute bwrap argv (already flattened) and return exit code."""
+def execute_bwrap(cmd: list[str], debug_tmpfs: bool, debug: bool = False) -> int:
+    """Execute bwrap argv (already flattened) and return exit code.
+
+    In `debug` mode we also pass `--info-fd <fd>` to bwrap on a pipe we
+    control, drain it on a daemon thread, and log the JSON it produces
+    after the child exits. Reading on a thread keeps us from deadlocking
+    if a future bwrap version writes more than the pipe buffer can hold.
+    """
     try:
-        result = subprocess.run(cmd)
-        return result.returncode
+        if not debug:
+            return subprocess.run(cmd).returncode
+
+        r, w = os.pipe()
+
+        def _drain_and_log_info_fd() -> None:
+            """Drain the info-fd pipe and log immediately on EOF.
+
+            bwrap writes its JSON between sandbox setup and exec'ing the
+            user command, then closes the fd. By logging from inside the
+            reader thread (rather than after proc.wait()) we surface the
+            info before the user command starts producing output, which
+            matters for long-running / interactive children like a shell.
+            """
+            chunks: list[bytes] = []
+            try:
+                while True:
+                    chunk = os.read(r, 4096)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+            finally:
+                try:
+                    os.close(r)
+                except OSError:
+                    pass
+            text = b''.join(chunks).decode('utf-8', errors='replace').strip()
+            if not text:
+                return
+            try:
+                parsed = json.loads(text)
+                logger.debug('bwrap --info-fd:\n' + json.dumps(parsed, indent=2))
+            except json.JSONDecodeError:
+                logger.debug(f'bwrap --info-fd (raw, not JSON): {text!r}')
+
+        reader = threading.Thread(target=_drain_and_log_info_fd, daemon=True)
+        reader.start()
+
+        # `--info-fd FD` immediately after `bwrap`. bwrap will inherit `w`
+        # via pass_fds; we close our parent-side copy so the reader sees
+        # EOF as soon as bwrap closes its end (right after writing).
+        cmd_with_info = [cmd[0], '--info-fd', str(w), *cmd[1:]]
+        try:
+            proc = subprocess.Popen(cmd_with_info, pass_fds=[w])
+        finally:
+            os.close(w)
+
+        returncode = proc.wait()
+        reader.join(timeout=2.0)
+        return returncode
     except FileNotFoundError:
         raise ExecutionError('bwrap not found in PATH') from None
     except Exception as e:

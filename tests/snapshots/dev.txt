@@ -1,11 +1,11 @@
-bwrap --unshare-user --unshare-ipc --unshare-pid --unshare-net --unshare-uts --unshare-cgroup --die-with-parent --new-session \
+bwrap --unshare-all --die-with-parent --new-session \
   --dev /dev \
   --proc /proc \
   --tmpfs /tmp \
   --tmpfs /home/sharzy \
   --bind /home/sharzy/ws/dev/proj/python/bww /home/sharzy/ws/dev/proj/python/bww \
   --ro-bind /nix/store /nix/store \
-  --symlink /nix/store/qv0zc2j0hg943xfi3g2vr4nyf1k5ycx6-etc/etc /etc/static \
+  --symlink /nix/store/k671n2h8c735l3rw3wqnvzsbzi28yiyx-etc/etc /etc/static \
   --unsetenv SSH_ASKPASS \
   --unsetenv SSH_AUTH_SOCK \
   --setenv PATH /run/current-system/sw/bin:/home/sharzy/.local/bin \

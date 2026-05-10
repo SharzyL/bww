@@ -26,8 +26,8 @@ bwrap --unshare-uts --unshare-cgroup --die-with-parent --new-session \
   --ro-bind /sys /sys \
   --symlink /etc/static/dbus-1 /etc/dbus-1 \
   --symlink /etc/static/fonts /etc/fonts \
-  --symlink /nix/store/qv0zc2j0hg943xfi3g2vr4nyf1k5ycx6-etc/etc /etc/static \
-  --symlink /nix/store/8a93hqa9rxmj2snn3jchgr0k8sxw2bfm-home-manager-files/.config/mimeapps.list /home/sharzy/.config/mimeapps.list \
+  --symlink /nix/store/k671n2h8c735l3rw3wqnvzsbzi28yiyx-etc/etc /etc/static \
+  --symlink /nix/store/6ddaq16y7d2f0ixvjxknbwvw2ylvcmm9-home-manager-files/.config/mimeapps.list /home/sharzy/.config/mimeapps.list \
   --symlink /nix/store/xj07xg9vzyn59vnv768lcvvkg8avsba1-graphics-drivers /run/opengl-driver \
   --chdir /home/sharzy/ws/dev/proj/python/bww \
   --argv0 echo \

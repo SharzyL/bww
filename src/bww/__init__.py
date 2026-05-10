@@ -132,7 +132,7 @@ def main() -> None:
         # --debug: log the bwrap command before exec.
         logger.debug(f'running bwrap:\n{formatted}')
 
-        exit_code = execute_bwrap(to_argv(bwrap_groups), args.debug_tmpfs)
+        exit_code = execute_bwrap(to_argv(bwrap_groups), args.debug_tmpfs, debug=bool(args.debug))
         sys.exit(exit_code)
 
     except ConfigError as e:
