@@ -36,11 +36,22 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 
+def _positional_args(node: kdl.Node) -> list[Any]:
+    """Return a node's positional (unnamed) entry values.
+
+    kdlpy v1 exposed `node.args` directly; kdlpy v2+ replaces that with a
+    unified `node.entries` list of `(name, value)` tuples where `name is
+    None` marks positional. Filter for that shape so call sites stay
+    one-liners.
+    """
+    return [val for name, val in node.entries if name is None]
+
+
 def _kdl_strings(node: kdl.Node, key: str) -> list[str]:
     """Collect all string args from `key` nodes inside `node`."""
     out: list[str] = []
     for n in list(node.getAll(key)):
-        for arg in n.args:
+        for arg in _positional_args(n):
             if not isinstance(arg, str):
                 raise ConfigError(f'Profile [{node.name}] {key} values must be strings')
             out.append(arg)
@@ -51,9 +62,10 @@ def _kdl_bool(node: kdl.Node, key: str) -> bool:
     """Read a single-bool option (multiple occurrences allowed; last wins)."""
     val = False
     for n in list(node.getAll(key)):
-        if len(n.args) != 1 or not isinstance(n.args[0], bool):
+        args = _positional_args(n)
+        if len(args) != 1 or not isinstance(args[0], bool):
             raise ConfigError(f'Profile [{node.name}] {key} must be a boolean')
-        val = n.args[0]
+        val = args[0]
     return val
 
 
@@ -61,9 +73,10 @@ def _kdl_kv_pairs(node: kdl.Node, key: str) -> list[tuple[str, str]]:
     """Collect (key, value) pairs from `key` nodes (must take exactly 2 string args)."""
     out: list[tuple[str, str]] = []
     for n in list(node.getAll(key)):
-        if len(n.args) != 2 or not all(isinstance(a, str) for a in n.args):
+        args = _positional_args(n)
+        if len(args) != 2 or not all(isinstance(a, str) for a in args):
             raise ConfigError(f'Profile [{node.name}] {key} must be: {key} "KEY" "VALUE"')
-        out.append((n.args[0], n.args[1]))
+        out.append((args[0], args[1]))
     return out
 
 
@@ -79,7 +92,7 @@ def _kdl_mount_entries(node: kdl.Node, spec: OptionSpec) -> list[MountEntry]:
     """
     out: list[MountEntry] = []
     for n in list(node.getAll(spec.key)):
-        args = list(n.args)
+        args = _positional_args(n)
         if not all(isinstance(a, str) for a in args):
             raise ConfigError(f'Profile [{node.name}] {spec.key} args must be strings')
         if spec.mount_mode == 'tmpfs':

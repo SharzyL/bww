@@ -13,6 +13,7 @@ from .executor import (
     build_bwrap_command,
     execute_bwrap,
     format_bwrap_command,
+    set_subreaper,
     to_argv,
 )
 from .utils import configure_logging, logger
@@ -94,6 +95,12 @@ def main() -> None:
         args = parser.parse_args()
         configure_logging(debug=bool(args.debug))
 
+        # Claim subreaper status before spawning anything so that daemons
+        # backgrounded inside setup-script (e.g. `tun2socks &`) reparent
+        # to us when their bash exits — and execute_bwrap can SIGTERM
+        # them once bwrap is done. Cheap, idempotent, no-op on failure.
+        set_subreaper()
+
         # ====================================================================
         # Handle --validate: Check config validity and exit
         # ====================================================================
@@ -132,7 +139,14 @@ def main() -> None:
         # --debug: log the bwrap command before exec.
         logger.debug(f'running bwrap:\n{formatted}')
 
-        exit_code = execute_bwrap(to_argv(bwrap_groups), args.debug_tmpfs, debug=bool(args.debug))
+        exit_code = execute_bwrap(
+            to_argv(bwrap_groups),
+            args.debug_tmpfs,
+            debug=bool(args.debug),
+            setup_script=runtime.setup_script,
+            extra_unshare_net=runtime.extra_unshare_net,
+            temp_files=runtime.temp_files,
+        )
         sys.exit(exit_code)
 
     except ConfigError as e:

@@ -187,6 +187,34 @@ profiles.c {
             config = load_config(str(config_file))
             assert config.profiles['c'].inherit == ['a', 'b']
 
+    def test_load_setup_script(self) -> None:
+        """setup-script is repeatable; entries append parent-then-child."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = Path(tmpdir) / 'config.kdl'
+            config_file.write_text(
+                """
+profiles.base {
+  setup-script "echo base-1"
+  setup-script "echo base-2"
+}
+profiles.child {
+  inherit "base"
+  setup-script "echo child"
+}
+profiles.empty {
+  rw "/a"
+}
+"""
+            )
+            config = load_config(str(config_file))
+            assert config.profiles['base'].setup_script == ['echo base-1', 'echo base-2']
+            assert config.profiles['child'].setup_script == ['echo child']
+            # Unset stays empty.
+            assert config.profiles['empty'].setup_script == []
+            # After resolution, parents come first then child appends.
+            resolved = resolve_profile(config.profiles['child'], config.profiles)
+            assert resolved.setup_script == ['echo base-1', 'echo base-2', 'echo child']
+
 
 class TestProfileResolution:
     """Test profile inheritance resolution."""

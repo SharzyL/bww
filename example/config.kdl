@@ -22,7 +22,7 @@ profiles.dev {
 
 profiles.desktop {
   tmpfs "~" // Tmpfs home directory
-  dev-bind true
+  dev-bind #true
 
   // Read-only system files
   ro "/nix/store"
@@ -47,10 +47,10 @@ profiles.desktop {
 
 defaults.chromium {
   inherit "desktop"
-  share-net true
-  share-pid true
-  share-ipc true
-  share-user true
+  share-net #true
+  share-pid #true
+  share-ipc #true
+  share-user #true
 
   ro "/etc/passwd"
   ro "/etc/group"

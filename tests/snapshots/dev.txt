@@ -1,4 +1,4 @@
-bwrap --unshare-all --die-with-parent --new-session \
+bwrap --unshare-user --unshare-ipc --unshare-pid --unshare-net --unshare-uts --unshare-cgroup --die-with-parent --new-session \
   --dev /dev \
   --proc /proc \
   --tmpfs /tmp \

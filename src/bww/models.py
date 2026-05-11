@@ -8,7 +8,7 @@ explicitly from the test suite.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, fields
-from typing import Literal
+from typing import Any, Literal
 
 from .options import OPTIONS
 
@@ -76,6 +76,9 @@ class Profile:
     share_ipc: bool = False
     share_pid: bool = False
     share_uts: bool = False
+    extra_unshare_net: bool = False
+    setup_script: list[str] = field(default_factory=list)
+    nameserver: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -106,6 +109,14 @@ class RuntimeConfig:
     share_ipc: bool = False
     share_pid: bool = False
     share_uts: bool = False
+    extra_unshare_net: bool = False
+    setup_script: list[str] = field(default_factory=list)
+    nameserver: list[str] = field(default_factory=list)
+    # tempfile.NamedTemporaryFile objects bww created for bwrap to bind
+    # (e.g. the nameserver-driven resolv.conf). Held here to keep their
+    # paths alive across bwrap exec; closing them at the end triggers
+    # tempfile's built-in auto-unlink (delete=True default).
+    temp_files: list[Any] = field(default_factory=list)
     debug: bool = False
     debug_tmpfs: bool = False
 

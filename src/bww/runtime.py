@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import shutil
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -208,6 +209,24 @@ def build_runtime_config(config: Config, args: argparse.Namespace, command: list
     if exe_path != target_path:
         exe_pending_symlinks.append((target_path, exe_path))
 
+    # 6b. nameserver: synthesize /etc/resolv.conf from user-supplied addrs.
+    # Goes before step 7 so the share-net auto-mount sees it's already
+    # registered and skips. The NamedTemporaryFile object is held on
+    # RuntimeConfig.temp_files; closing it at end-of-run triggers
+    # tempfile's built-in `delete=True` auto-unlink.
+    temp_files: list[Any] = []
+    if merged_profile.nameserver:
+        resolv = tempfile.NamedTemporaryFile(  # noqa: SIM115 — kept alive on purpose
+            mode='w', prefix='bww-resolv-', suffix='.conf', delete=True
+        )
+        resolv.write('options single-request-reopen\n')
+        for addr in merged_profile.nameserver:
+            resolv.write(f'nameserver {addr}\n')
+        resolv.flush()
+        by_dest['/etc/resolv.conf'] = Mount(src=resolv.name, dest='/etc/resolv.conf', mode='ro')
+        temp_files.append(resolv)
+        logger.debug(f'nameserver: wrote {resolv.name} with {len(merged_profile.nameserver)} entry/entries')
+
     # 7. share-net: libc name resolution typically relies on /etc/* files.
     # Mount them read-only if present, without overriding explicit user mounts.
     if merged_profile.share_net:
@@ -257,6 +276,7 @@ def build_runtime_config(config: Config, args: argparse.Namespace, command: list
         'symlinks': symlinks,
         'set_env': resolved_set_env,
         'unset_env': resolved_unset_env,
+        'temp_files': temp_files,
         'debug': getattr(args, 'debug', False),
         'debug_tmpfs': getattr(args, 'debug_tmpfs', False),
     }

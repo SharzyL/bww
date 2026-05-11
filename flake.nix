@@ -56,7 +56,36 @@
           export PATH="$PWD/.venv/bin:$PATH"
         '';
       };
-      overlay = final: _: {
+      # Override the nixpkgs-packaged kdl-py to point at tabatkins/kdlpy
+      # main, which supports KDL v2 (triple-quoted strings etc.). Keep
+      # this in sync with the git revision pinned in pyproject.toml /
+      # uv.lock — otherwise the dev shell's Nix-injected kdl-py 1.2.0
+      # shadows the venv's git build and you'll see v1 parse errors.
+      kdlpyRev = "d9a220762fb9f55e4f59296256221084c26f54da";
+      pythonOverrides = pyFinal: pyPrev: {
+        kdl-py = pyPrev.kdl-py.overrideAttrs (old: {
+          version = "main-${builtins.substring 0 7 kdlpyRev}";
+          src = pyPrev.pkgs.fetchFromGitHub {
+            owner = "tabatkins";
+            repo = "kdlpy";
+            rev = kdlpyRev;
+            # Run `nix build` once with `hash = lib.fakeHash` to get the
+            # real value, then paste it here.
+            hash = "sha256-UttkZOkimu58ctDaH2o1Vv+oYLFute8Dwc1eaToeArE=";
+          };
+          # nixpkgs' kdl-py 1.2.0 derivation runs `python tests/run.py`
+          # as installCheck; tabatkins/kdlpy main reorganised its tests
+          # so that file no longer exists. Skip the check rather than
+          # adapt — we only need the package importable.
+          doCheck = false;
+          doInstallCheck = false;
+        });
+      };
+      overlay = final: prev: {
+        python3 = prev.python3.override (old: {
+          packageOverrides = prev.lib.composeExtensions (old.packageOverrides or (_: _: { })) pythonOverrides;
+        });
+        python3Packages = final.python3.pkgs;
         ${name} = final.python3Packages.callPackage makePkg { };
       };
 

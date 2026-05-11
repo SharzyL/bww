@@ -111,10 +111,12 @@ def read_kdl_option_inherit(node: kdl.Node) -> list[str]:
     """Read the special `inherit` KDL key (string list, not in OPTIONS)."""
     out: list[str] = []
     for n in list(node.getAll('inherit')):
-        for arg in n.args:
-            if not isinstance(arg, str):
+        for name, val in n.entries:
+            if name is not None:
+                continue  # skip named props
+            if not isinstance(val, str):
                 raise ConfigError(f'Profile [{node.name}] inherit values must be strings')
-            out.append(arg)
+            out.append(val)
     return out
 
 
@@ -140,12 +142,13 @@ def _parse_profile(name: str, data: dict[str, Any]) -> Profile:
     bwargs = _normalize_path_list(data.get('bwargs', []), f'Profile [{name}] bwargs')
     set_env = _normalize_kv_pairs(data.get('set_env', []), f'Profile [{name}] set-env')
     unset_env = _normalize_path_list(data.get('unset_env', []), f'Profile [{name}] unset-env')
+    setup_script = _normalize_path_list(data.get('setup_script', []), f'Profile [{name}] setup-script')
+    nameserver = _normalize_path_list(data.get('nameserver', []), f'Profile [{name}] nameserver')
 
-    bool_kwargs: dict[str, bool] = {}
+    extra_kwargs: dict[str, Any] = {}
     for spec in OPTIONS:
-        if spec.kind != 'bool':
-            continue
-        bool_kwargs[spec.dest] = _get_bool(data, spec.key, f'Profile [{name}]')
+        if spec.kind == 'bool':
+            extra_kwargs[spec.dest] = _get_bool(data, spec.key, f'Profile [{name}]')
 
     return Profile(
         name=name,
@@ -156,7 +159,9 @@ def _parse_profile(name: str, data: dict[str, Any]) -> Profile:
         bwargs=bwargs,
         set_env=set_env,
         unset_env=unset_env,
-        **bool_kwargs,
+        setup_script=setup_script,
+        nameserver=nameserver,
+        **extra_kwargs,
     )
 
 

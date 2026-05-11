@@ -5,7 +5,9 @@ authors = [
     {name = "SharzyL", email = "me@sharzy.in"},
 ]
 dependencies = [
-    "kdl-py>=1.2.0",
+    # KDL v2 (triple-quoted strings etc.) only landed on tabatkins/kdlpy
+    # main; pin to git until a v2-capable release ships to PyPI.
+    "kdl-py @ git+https://github.com/tabatkins/kdlpy.git@main",
     "loguru>=0.7",
 ]
 requires-python = ">=3.12"

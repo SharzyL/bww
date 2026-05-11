@@ -84,6 +84,21 @@ OPTIONS: tuple[OptionSpec, ...] = (
         cli_flag='--dev-bind',
         help='Bind-mount host /dev into sandbox (enables device access)',
     ),
+    # ----- bool: outer-process wrapper -----
+    OptionSpec(
+        kind='bool',
+        key='extra-unshare-net',
+        dest='extra_unshare_net',
+        cli_flag='--extra-unshare-net',
+        help=(
+            'Wrap bwrap in `unshare --fork --user --map-root-user --net --` '
+            'so the sandbox netns is created at the outer level (owned by a '
+            'userns where you keep full caps; uid 0 there gives setup-script '
+            'tooling legacy-root caps across exec). bww auto-adds bwrap '
+            '`--uid/--gid` to map back to your host uid inside the sandbox '
+            'so payload `id` stays transparent.'
+        ),
+    ),
     # ----- mounts (handled by mount builder, skipped by emit loop) -----
     OptionSpec(
         kind='mount',
@@ -138,5 +153,46 @@ OPTIONS: tuple[OptionSpec, ...] = (
         dest='bwargs',
         cli_flag='--bwargs',
         help='Extra bwrap arguments (space-separated string)',
+    ),
+    # ----- DNS override -----
+    OptionSpec(
+        kind='pattern-list',
+        key='nameserver',
+        dest='nameserver',
+        cli_flag='--nameserver',
+        help=(
+            'DNS nameserver to use inside the sandbox (repeatable). If '
+            'any are specified, bww writes a temp file with one '
+            '`nameserver <addr>` line per entry and ro-binds it as '
+            '/etc/resolv.conf (overriding any host resolv.conf mount).'
+        ),
+        cli_metavar='ADDR',
+    ),
+    # ----- setup hook (runs while bwrap is paused on --block-fd) -----
+    # Always runs on the host via `bash -c`. Use `nsenter`/`setns`-style
+    # tools with the exported env vars to enter any sandbox namespace
+    # yourself. Reuses 'pattern-list' value-shape: list of strings, appended
+    # across profile-inheritance and CLI; each entry is one bash invocation.
+    OptionSpec(
+        kind='pattern-list',
+        key='setup-script',
+        dest='setup_script',
+        cli_flag='--setup-script',
+        help=(
+            'Bash snippet to run on the host while bwrap is paused, before '
+            'the payload exec. Repeatable; entries run in declaration order '
+            '(profile-inheritance order, then CLI). Exported env: '
+            "CHILD_PID = bwrap's sandbox-init pid; "
+            'BWRAP_NETNS = /proc/<child_pid>/ns/net; '
+            'BWRAP_USERNS = /proc/<bww_pid>/fd/<N> (fd handle; no proc '
+            'lives in this userns); '
+            'EXTRA_{NETNS,USERNS} = /proc/<unshare_pid>/ns/{net,user} '
+            '(only when --extra-unshare-net is on). Daemons backgrounded '
+            'here (e.g. `tun2socks ... &`) are SIGTERMed automatically '
+            'when bwrap exits — bww runs as a subreaper. Procfs-path env '
+            'vars survive cross-userns access (e.g. pasta after setns); '
+            "the fd-handle one only works from bww's own userns."
+        ),
+        cli_metavar='CMD',
     ),
 )
