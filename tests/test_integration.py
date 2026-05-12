@@ -27,35 +27,39 @@ def _strip_ansi(s: str) -> str:
     return re.sub(r'\x1b\[[0-9;]*m', '', s)
 
 
-def run_bww(*args: str) -> tuple[int, str, str]:
-    """Run bww command and return (exit_code, stdout, stderr)."""
+def _base_subproc_env(tmpdir: str) -> dict[str, str]:
+    """Build the env for a subprocess `bww` invocation.
+
+    Strips PYTHONPATH so the venv's git-pinned kdl-py v2 wins over any
+    `kdl-py 1.2.0` the Nix dev-shell may have leaked in via propagated
+    build inputs (`Node.entries` is v2-only and the loader requires it).
+    """
     import os
 
-    # Build command: run bww via Python module directly
-    cmd = [sys.executable, '-m', 'bww'] + list(args)
+    env = {k: v for k, v in os.environ.items() if k != 'PYTHONPATH'}
+    env['XDG_CONFIG_HOME'] = tmpdir
+    return env
 
-    # Create temp directory for config to avoid interfering with user's ~/.config
+
+def run_bww(*args: str) -> tuple[int, str, str]:
+    """Run bww command and return (exit_code, stdout, stderr)."""
+    cmd = [sys.executable, '-m', 'bww'] + list(args)
     with tempfile.TemporaryDirectory() as tmpdir:
-        env = os.environ.copy()
-        env['XDG_CONFIG_HOME'] = tmpdir
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
             cwd=PROJECT_ROOT,
-            env=env,
+            env=_base_subproc_env(tmpdir),
         )
     return result.returncode, result.stdout, result.stderr
 
 
 def run_bww_with_env(env_overrides: dict[str, str], *args: str) -> tuple[int, str, str]:
     """Run bww with environment overrides and return (exit_code, stdout, stderr)."""
-    import os
-
     cmd = [sys.executable, '-m', 'bww'] + list(args)
     with tempfile.TemporaryDirectory() as tmpdir:
-        env = os.environ.copy()
-        env['XDG_CONFIG_HOME'] = tmpdir
+        env = _base_subproc_env(tmpdir)
         env.update(env_overrides)
         result = subprocess.run(
             cmd,

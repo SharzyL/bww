@@ -51,9 +51,15 @@
           bubblewrap
           passt
         ]);
-        # to allow lsp to find python
+        # `uv` keeps the venv in `.venv`; everything we need (including
+        # the git-pinned kdl-py v2) lives there. Nix's Python dev-shell
+        # also injects propagated deps via PYTHONPATH — including
+        # `kdl-py 1.2.0` from nixpkgs, which would shadow the venv's v2
+        # build and break parsing (`Node.entries` is v2-only). Unset
+        # PYTHONPATH so the venv's site-packages wins.
         shellHook = ''
           export PATH="$PWD/.venv/bin:$PATH"
+          unset PYTHONPATH
         '';
       };
       # Override the nixpkgs-packaged kdl-py to point at tabatkins/kdlpy

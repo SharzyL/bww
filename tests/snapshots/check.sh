@@ -4,6 +4,12 @@
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
+# The Nix dev-shell leaks `kdl-py 1.2.0` into PYTHONPATH via propagated
+# build inputs, which would shadow the venv's git-pinned v2 build (the
+# loader needs `Node.entries`, v2-only). Strip it so `uv run` picks up
+# the venv's site-packages cleanly.
+unset PYTHONPATH
+
 fail=0
 for prof in dev defaults.firefox defaults.chromium; do
   fname="tests/snapshots/$(echo "$prof" | tr . _).txt"
