@@ -460,7 +460,6 @@ class TestRuntimeConfigBuilding:
             tmpfs=[],
             bwargs=None,
             debug=False,
-            debug_tmpfs=False,
         )
         runtime = build_runtime_config(config, args, ['echo', 'test'])
         assert runtime.argv0 == 'echo'
@@ -484,7 +483,6 @@ class TestRuntimeConfigBuilding:
             tmpfs=[],
             bwargs=None,
             debug=False,
-            debug_tmpfs=False,
         )
         runtime = build_runtime_config(config, args, ['/bin/echo', 'test'])
         assert any(m.dest == '/home' and m.mode == 'rw' for m in runtime.mounts)
@@ -506,7 +504,6 @@ class TestRuntimeConfigBuilding:
             dev_bind=False,
             reuse_session=False,
             debug=False,
-            debug_tmpfs=False,
         )
         runtime = build_runtime_config(config, args, ['echo'])
         assert runtime.share_net is True
@@ -528,7 +525,6 @@ class TestRuntimeConfigBuilding:
             dev_bind=False,
             reuse_session=False,
             debug=False,
-            debug_tmpfs=False,
         )
         runtime = build_runtime_config(config, args, ['echo'])
         assert runtime.dev_bind is True
@@ -550,7 +546,6 @@ class TestRuntimeConfigBuilding:
             dev_bind=False,
             reuse_session=False,
             debug=False,
-            debug_tmpfs=False,
         )
         runtime = build_runtime_config(config, args, ['echo'])
         assert runtime.share_net is True
@@ -572,7 +567,6 @@ class TestRuntimeConfigBuilding:
             dev_bind=False,
             reuse_session=False,
             debug=False,
-            debug_tmpfs=False,
         )
         runtime = build_runtime_config(config, args, ['echo'])
         assert runtime.reuse_session is True
@@ -602,7 +596,6 @@ class TestRuntimeConfigBuilding:
             dev_bind=False,
             reuse_session=False,
             debug=False,
-            debug_tmpfs=False,
         )
         runtime = build_runtime_config(config, args, ['echo'])
         assert runtime.share_user is True
@@ -624,7 +617,6 @@ class TestRuntimeConfigBuilding:
             tmpfs=['/tmp'],
             bwargs=None,
             debug=False,
-            debug_tmpfs=False,
         )
         runtime = build_runtime_config(config, args, ['test'])
         # Should have mounts from profile AND CLI
@@ -658,7 +650,6 @@ class TestRuntimeConfigBuilding:
             dev_bind=False,
             reuse_session=False,
             debug=False,
-            debug_tmpfs=False,
         )
         runtime = build_runtime_config(config, args, ['echo'])
         assert ('FOO', 'bar') in runtime.set_env
@@ -695,7 +686,6 @@ class TestRuntimeConfigBuilding:
             dev_bind=False,
             reuse_session=False,
             debug=False,
-            debug_tmpfs=False,
         )
         runtime = build_runtime_config(config, args, ['echo'])
         assert 'BWW_TEST_A' in runtime.unset_env
@@ -732,7 +722,6 @@ class TestRuntimeConfigBuilding:
             dev_bind=False,
             reuse_session=False,
             debug=False,
-            debug_tmpfs=False,
         )
         runtime = build_runtime_config(config, args, ['echo'])
         assert 'BWW_PFX_X' in runtime.unset_env
@@ -772,7 +761,6 @@ class TestRuntimeConfigBuilding:
             dev_bind=False,
             reuse_session=False,
             debug=False,
-            debug_tmpfs=False,
         )
         runtime = build_runtime_config(config, args, ['echo'])
         assert ('BWW_KEEP_A', 'replaced') in runtime.set_env
@@ -850,7 +838,6 @@ profiles.test {
             dev_bind=False,
             reuse_session=False,
             debug=False,
-            debug_tmpfs=False,
         )
         with pytest.raises(ConfigError, match='glob is not allowed'):
             build_runtime_config(config, args, ['echo'])
@@ -889,7 +876,6 @@ profiles.test {
             dev_bind=False,
             reuse_session=False,
             debug=False,
-            debug_tmpfs=False,
         )
         runtime = build_runtime_config(config, args, ['echo'])
         x_mounts = [m for m in runtime.mounts if m.dest == '/x']
@@ -910,7 +896,6 @@ profiles.test {
             tmpfs=[],
             bwargs=None,
             debug=False,
-            debug_tmpfs=False,
         )
         with pytest.raises(ConfigError, match='command'):
             build_runtime_config(config, args, [])

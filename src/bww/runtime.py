@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import argparse
 import shutil
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -209,29 +208,21 @@ def build_runtime_config(config: Config, args: argparse.Namespace, command: list
     if exe_path != target_path:
         exe_pending_symlinks.append((target_path, exe_path))
 
-    # 6b. nameserver: synthesize /etc/resolv.conf from user-supplied addrs.
-    # Goes before step 7 so the share-net auto-mount sees it's already
-    # registered and skips. The NamedTemporaryFile object is held on
-    # RuntimeConfig.temp_files; closing it at end-of-run triggers
-    # tempfile's built-in `delete=True` auto-unlink.
-    temp_files: list[Any] = []
-    if merged_profile.nameserver:
-        resolv = tempfile.NamedTemporaryFile(  # noqa: SIM115 — kept alive on purpose
-            mode='w', prefix='bww-resolv-', suffix='.conf', delete=True
-        )
-        resolv.write('options single-request-reopen\n')
-        for addr in merged_profile.nameserver:
-            resolv.write(f'nameserver {addr}\n')
-        resolv.flush()
-        by_dest['/etc/resolv.conf'] = Mount(src=resolv.name, dest='/etc/resolv.conf', mode='ro')
-        temp_files.append(resolv)
-        logger.debug(f'nameserver: wrote {resolv.name} with {len(merged_profile.nameserver)} entry/entries')
+    # 6b. nameserver is materialized by the executor via bwrap's
+    # `--ro-bind-data FD /etc/resolv.conf`, so we don't add a Mount
+    # entry here. We do need to keep share-net (step 7) from also
+    # auto-mounting the host's /etc/resolv.conf — that would conflict
+    # with the synthesized one. The synthesized content lives in a
+    # pipe at exec time; no host-side tempfile is created.
 
     # 7. share-net: libc name resolution typically relies on /etc/* files.
-    # Mount them read-only if present, without overriding explicit user mounts.
+    # Mount them read-only if present, without overriding explicit user
+    # mounts. When nameserver is set, the executor synthesizes
+    # /etc/resolv.conf via --ro-bind-data, so skip the auto-mount.
     if merged_profile.share_net:
+        skip = {'/etc/resolv.conf'} if merged_profile.nameserver else set()
         for etc_path in ('/etc/hosts', '/etc/resolv.conf', '/etc/resolve.conf', '/etc/nsswitch.conf'):
-            if etc_path in by_dest:
+            if etc_path in by_dest or etc_path in skip:
                 continue
             if Path(etc_path).exists():
                 by_dest[etc_path] = Mount(src=etc_path, dest=etc_path, mode='ro')
@@ -276,9 +267,7 @@ def build_runtime_config(config: Config, args: argparse.Namespace, command: list
         'symlinks': symlinks,
         'set_env': resolved_set_env,
         'unset_env': resolved_unset_env,
-        'temp_files': temp_files,
         'debug': getattr(args, 'debug', False),
-        'debug_tmpfs': getattr(args, 'debug_tmpfs', False),
     }
     for spec in OPTIONS:
         if spec.kind == 'mount':

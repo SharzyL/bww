@@ -92,7 +92,6 @@ Options:
   --dev-bind          Bind-mount host /dev into sandbox (enables device access)
   --reuse-session     Do not create a new session (omit bwrap --new-session)
   --debug             Print bwrap command before executing
-  --debug-tmpfs       Show tmpfs content after exit
   --validate          Validate configuration and exit
   --dry-run           Show what would be executed without running
 ```

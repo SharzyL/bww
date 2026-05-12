@@ -1,5 +1,6 @@
 """Execution layer: bubblewrap command building and execution."""
 
+import contextlib
 import ctypes
 import fcntl
 import json
@@ -8,8 +9,9 @@ import shlex
 import signal
 import subprocess
 import time
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
+from .models import RuntimeConfig
 from .options import OPTIONS, OptionSpec
 from .utils import logger
 
@@ -28,6 +30,13 @@ _NS_GET_USERNS = 0xB701
 # their immediate parent (bash) exits, instead of escaping to PID 1. We
 # can then collect and kill them once bwrap is done.
 _PR_SET_CHILD_SUBREAPER = 36
+
+# Placeholder token inserted by `build_bwrap_command` where the
+# nameserver-driven `--ro-bind-data` fd would go. `execute_bwrap`
+# substitutes it with the real fd number right before Popen. The
+# placeholder makes `--dry-run` output truthful without claiming an
+# fd number we can't predict ahead of execution.
+_RESOLV_FD_PLACEHOLDER = '<resolv-fd>'
 
 
 def set_subreaper() -> None:
@@ -68,12 +77,17 @@ def _reap_pids(targets: set[int], grace: float = 0.5) -> None:
         _drain_zombies()
         return
     logger.debug(f'reaping setup-script daemons reparented to bww: {sorted(targets)}')
-    remaining = set(targets)
-    for pid in remaining:
+    # Only track pids where SIGTERM actually landed. Building `remaining`
+    # from the loop side-steps the "mutate-set-during-iteration"
+    # RuntimeError that biting `remaining.discard(pid)` inside the loop
+    # would cause on the first already-exited target.
+    remaining: set[int] = set()
+    for pid in targets:
         try:
             os.kill(pid, signal.SIGTERM)
+            remaining.add(pid)
         except ProcessLookupError:
-            remaining.discard(pid)
+            pass
     deadline = time.monotonic() + grace
     while remaining and time.monotonic() < deadline:
         try:
@@ -101,6 +115,43 @@ def _drain_zombies() -> None:
                 break
         except ChildProcessError:
             break
+
+
+def _read_bwrap_info(info_r: int) -> dict[str, Any]:
+    """Read bwrap's --info-fd into a JSON object.
+
+    Reads incrementally rather than waiting for EOF: with `unshare --fork`
+    the unshare-parent inherits info_w via pass_fds and keeps it open
+    until bwrap exits, so info_r would never EOF during the setup window.
+    Returns as soon as the buffer parses as a complete JSON object.
+    """
+    buf = b''
+    while True:
+        chunk = os.read(info_r, 4096)
+        if not chunk:
+            raise ExecutionError('info-fd closed before a complete JSON object arrived')
+        buf += chunk
+        try:
+            return json.loads(buf.decode('utf-8'))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            # Partial JSON or a multi-byte UTF-8 codepoint split across
+            # reads — keep accumulating.
+            continue
+
+
+def _open_bwrap_userns_fd(child_pid: int) -> int:
+    """Open an nsfs fd for the userns owning the bwrap sandbox netns.
+
+    BWRAP_USERNS has no live process (it's an intermediate userns bwrap
+    unshared past), so no /proc/<pid>/ns/user exists for it. Compute it
+    via NS_GET_USERNS on the bwrap netns fd; the returned fd is exposed
+    to setup-scripts via /proc/<bww_pid>/fd/<N>.
+    """
+    net_fd = os.open(f'/proc/{child_pid}/ns/net', os.O_RDONLY)
+    try:
+        return fcntl.ioctl(net_fd, _NS_GET_USERNS)
+    finally:
+        os.close(net_fd)
 
 
 def _log_ns_readlinks(
@@ -208,10 +259,6 @@ def _run_setup_scripts(
             raise SetupScriptFailed(i, rc, script)
 
 
-if TYPE_CHECKING:
-    from .models import RuntimeConfig
-
-
 class ExecutionError(Exception):
     """Raised when bwrap execution fails."""
 
@@ -282,7 +329,7 @@ def format_bwrap_command(groups: BwrapGroups) -> str:
     return '\n'.join(line + ' \\' if idx < len(lines) - 1 else line for idx, line in enumerate(lines))
 
 
-def _emit_option(spec: OptionSpec, runtime: 'RuntimeConfig') -> BwrapGroups:
+def _emit_option(spec: OptionSpec, runtime: RuntimeConfig) -> BwrapGroups:
     """Emit bwrap groups for one option. Dispatches by option name.
 
     Mount specs are owned by the mount builder (`_emit_mounts`) and return
@@ -292,8 +339,8 @@ def _emit_option(spec: OptionSpec, runtime: 'RuntimeConfig') -> BwrapGroups:
     """
     if spec.kind == 'mount':
         return []  # owned by _emit_mounts
-    if spec.key in ('setup-script', 'extra-unshare-net', 'nameserver'):
-        return []  # consumed by execute_bwrap / build wrapper / runtime, not bwrap flags
+    if spec.key in ('setup-script', 'extra-unshare-net'):
+        return []  # consumed by execute_bwrap / build wrapper, not bwrap flags
     match spec.key:
         # --- bools ---
         case 'share-net':
@@ -318,11 +365,16 @@ def _emit_option(spec: OptionSpec, runtime: 'RuntimeConfig') -> BwrapGroups:
             return [['--setenv', k, v] for k, v in runtime.set_env]
         case 'unset-env':
             return [['--unsetenv', v] for v in runtime.unset_env]
+        case 'nameserver':
+            # The fd is allocated and substituted by execute_bwrap.
+            if not runtime.nameserver:
+                return []
+            return [['--ro-bind-data', _RESOLV_FD_PLACEHOLDER, '/etc/resolv.conf']]
         case _:
             raise ValueError(f'_emit_option: no case for spec.key={spec.key!r}')
 
 
-def _emit_mounts(runtime: 'RuntimeConfig') -> BwrapGroups:
+def _emit_mounts(runtime: RuntimeConfig) -> BwrapGroups:
     """Emit mount groups in dest lexicographic order — a valid topological
     order for the parent-before-child constraint on normalized paths.
 
@@ -343,7 +395,7 @@ def _emit_mounts(runtime: 'RuntimeConfig') -> BwrapGroups:
     return out
 
 
-def build_bwrap_command(runtime_config: 'RuntimeConfig') -> BwrapGroups:
+def build_bwrap_command(runtime_config: RuntimeConfig) -> BwrapGroups:
     """Build the bwrap command as a list of token groups.
 
     Group layout: optional wrapper prefix groups (e.g. `unshare ...
@@ -408,21 +460,76 @@ def build_bwrap_command(runtime_config: 'RuntimeConfig') -> BwrapGroups:
     return groups
 
 
+def _kill_bwrap_tree(proc: subprocess.Popen[bytes], child_pid: int | None) -> None:
+    """SIGKILL bwrap's paused sandbox-init (if known) plus the wrapper.
+
+    bwrap is a multi-process tree (wrapper → intermediate → sandbox-init),
+    and the only process actually blocked on `read(block_fd)` is the
+    sandbox-init (`child-pid` from info-fd) — that's the one about to
+    `execvp` the payload. SIGKILL'ing only the top of the tree leaves
+    the sandbox-init as an orphan picked up by our subreaper; once
+    block_w closes, its read returns 0 and it runs the payload. So
+    target the sandbox-init directly first, then SIGKILL the wrapper
+    for cleanup. SIGTERM is unreliable here too: unshare(1) in --fork
+    mode ignores it, and bwrap retries EINTR. Idempotent — safe to
+    call again from outer except handlers.
+    """
+    if child_pid is not None:
+        try:
+            os.kill(child_pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    proc.kill()
+    proc.wait()
+
+
+def _build_nameserver_fd(nameservers: list[str]) -> int:
+    """Open a pipe pre-filled with a resolv.conf body for bwrap to copy.
+
+    bwrap's `--ro-bind-data FD DEST` reads from FD into a tmpfile and
+    bind-mounts it read-only at DEST — no host-side file needed. The
+    resolv.conf content is tiny (a handful of bytes per nameserver,
+    well under the 64KiB default pipe buffer on Linux), so we write
+    it synchronously and close the write end. bwrap then drains the
+    read end as part of its setup.
+    """
+    body = 'options single-request-reopen\n'
+    body += ''.join(f'nameserver {ns}\n' for ns in nameservers)
+    r, w = os.pipe()
+    try:
+        os.write(w, body.encode())
+    finally:
+        os.close(w)
+    return r
+
+
+def _inject_after_bwrap(cmd: list[str], extra: list[str]) -> list[str]:
+    """Return a copy of `cmd` with `extra` spliced right after 'bwrap'.
+
+    When extra-unshare-net is on, cmd[0] is `unshare` and the wrapped
+    `bwrap` shows up further in. Anchor on the 'bwrap' token so bwrap
+    flags don't leak onto the wrapper.
+    """
+    try:
+        bwrap_idx = cmd.index('bwrap')
+    except ValueError as e:
+        raise ExecutionError("'bwrap' token not found in command") from e
+    return [*cmd[: bwrap_idx + 1], *extra, *cmd[bwrap_idx + 1 :]]
+
+
 def execute_bwrap(
     cmd: list[str],
-    debug_tmpfs: bool,
     debug: bool = False,
     setup_script: list[str] | None = None,
     extra_unshare_net: bool = False,
-    temp_files: list[Any] | None = None,
+    nameserver: list[str] | None = None,
 ) -> int:
     """Execute bwrap argv (already flattened) and return exit code.
 
-    `temp_files` is a list of tempfile.NamedTemporaryFile objects bww
-    created on the host for bwrap to bind (e.g. the nameserver-driven
-    /etc/resolv.conf). They're held by the caller across this call so
-    their paths stay alive; we close them in the outer finally, which
-    triggers tempfile's built-in auto-unlink (delete=True default).
+    `nameserver`, if non-empty, is materialized into a pipe and handed
+    to bwrap as `--ro-bind-data <fd> /etc/resolv.conf` — no host-side
+    tempfile is created. The pipe-read fd is passed through `pass_fds`
+    so bwrap (and the unshare wrapper, when present) inherits it.
 
     Whenever `debug` is on or `setup_script` is non-empty, we pass
     `--info-fd <fd>` and `--block-fd <fd>` to bwrap on pipes we
@@ -435,158 +542,161 @@ def execute_bwrap(
     is on), then run each setup-script in declaration order on the
     host, then write to block-fd to release bwrap — no reader thread,
     no race against the payload's output.
+
+    Failure handling: once bwrap is running and parked on block-fd,
+    any unhandled exception below — info-fd parse error, ioctl
+    failure, KeyboardInterrupt — would otherwise leak block_w and let
+    sandbox-init see EOF and proceed to execvp at parent GC time.
+    The outer try wraps the live-bwrap window in a `_kill_bwrap_tree`
+    teardown so the payload never runs on an error path.
     """
     scripts = list(setup_script or [])
-    files_to_close = list(temp_files or [])
+    nameservers = list(nameserver or [])
+    ns_fd = -1
     try:
-        if not debug and not scripts:
-            return subprocess.run(cmd).returncode
-
-        info_r, info_w = os.pipe()
-        block_r, block_w = os.pipe()
-
-        # Insert --info-fd / --block-fd right after `bwrap`, not after cmd[0]
-        # — when extra-unshare-net is on, cmd[0] is `unshare` and these flags
-        # belong on bwrap, not on the wrapper.
-        try:
-            bwrap_idx = cmd.index('bwrap')
-        except ValueError as e:
-            raise ExecutionError("'bwrap' token not found in command") from e
-        cmd_with_fds = [
-            *cmd[: bwrap_idx + 1],
-            '--info-fd',
-            str(info_w),
-            '--block-fd',
-            str(block_r),
-            *cmd[bwrap_idx + 1 :],
-        ]
-        try:
-            proc = subprocess.Popen(cmd_with_fds, pass_fds=[info_w, block_r])
-        finally:
-            # Close child-side ends in the parent. info_w must be closed
-            # so EOF propagates on info_r once bwrap finishes writing.
-            os.close(info_w)
-            os.close(block_r)
-
-        # bwrap's --info-fd contract is a single JSON object with a numeric
-        # `child-pid`. We can't rely on EOF here: with the `unshare --fork`
-        # wrapper, the unshare-parent also inherits `info_w` via pass_fds
-        # and keeps it open until bwrap exits, so info_r never reaches EOF
-        # during the read window. Instead, read incrementally until the
-        # buffer parses as a complete JSON object.
-        buf = b''
-        parsed: dict[str, Any]
-        try:
-            while True:
-                chunk = os.read(info_r, 4096)
-                if not chunk:
-                    raise ExecutionError('info-fd closed before a complete JSON object arrived')
-                buf += chunk
-                try:
-                    parsed = json.loads(buf.decode('utf-8'))
-                except json.JSONDecodeError:
-                    continue
-                break
-        finally:
-            os.close(info_r)
-        if debug:
-            logger.debug('bwrap --info-fd:\n' + json.dumps(parsed, indent=2))
-        child_pid: int = parsed['child-pid']
-
-        # BWRAP_USERNS has no process living in it (it's an intermediate
-        # userns bwrap created and then unshared past), so there's no
-        # /proc/<pid>/ns/user we can hand to setup-script. Compute it via
-        # NS_GET_USERNS on the bwrap netns fd and hold the resulting fd
-        # open in bww — it gets exposed via /proc/<bww>/fd/<N>. The other
-        # three handles (BWRAP_NETNS, EXTRA_NETNS, EXTRA_USERNS) all have
-        # live processes in them (bwrap sandbox-init / unshare-parent), so
-        # we hand out procfs paths directly — those work from sandbox-side
-        # userns contexts where bww's /proc/<bww>/fd/* would fail the
-        # cross-userns ptrace check.
-        net_fd_tmp = os.open(f'/proc/{child_pid}/ns/net', os.O_RDONLY)
-        try:
-            bwrap_user_fd = fcntl.ioctl(net_fd_tmp, _NS_GET_USERNS)
-        finally:
-            os.close(net_fd_tmp)
-
-        script_failure: SetupScriptFailed | None = None
-        try:
-            if debug:
-                _log_ns_readlinks(
-                    unshare_pid=proc.pid,
-                    child_pid=child_pid,
-                    bwrap_user_fd=bwrap_user_fd,
-                    extra_unshare_net=extra_unshare_net,
-                )
+        if nameservers:
+            ns_fd = _build_nameserver_fd(nameservers)
+            # build_bwrap_command emitted `--ro-bind-data <resolv-fd-placeholder>
+            # /etc/resolv.conf` for us; swap the placeholder for the real fd.
             try:
-                _run_setup_scripts(
-                    child_pid,
-                    scripts,
-                    unshare_pid=proc.pid,
-                    bwrap_user_fd=bwrap_user_fd,
-                    extra_unshare_net=extra_unshare_net,
-                )
-            except SetupScriptFailed as e:
-                # Stash the failure; we still need to fall through into
-                # the snapshot + bwrap-teardown sequence below so we kill
-                # the paused sandbox and collect any partial daemons.
-                script_failure = e
-                logger.error(str(e))
-        finally:
-            os.close(bwrap_user_fd)
-
-        # Snapshot setup-script daemons BEFORE releasing/killing bwrap.
-        # By now every setup-script bash has returned (we waited for
-        # each via subprocess.run), so backgrounded daemons have already
-        # reparented here. Anything that orphans *after* this point is
-        # bwrap's own teardown offspring (intermediate / sandbox-init
-        # stragglers) and not ours to kill.
-        setup_daemons = _snapshot_setup_descendants(exclude_pid=proc.pid)
-
-        try:
-            if script_failure is not None:
-                # Abort path. bwrap is a multi-process tree (wrapper →
-                # intermediate → sandbox-init), and only the sandbox-init
-                # (`child_pid` from info-fd) is the one actually paused
-                # on read(block_fd) — it's the one about to exec the
-                # payload. SIGKILL the top of the tree alone isn't
-                # enough: the sandbox-init survives as an orphan reaped
-                # by our subreaper, and as soon as block_w closes its
-                # read returns 0 and it proceeds to execvp. So SIGKILL
-                # child_pid first, then the wrapper for cleanup, then
-                # close. SIGTERM would be racy too (unshare(1) ignores
-                # it in --fork mode, and bwrap retries EINTR), so we go
-                # straight to SIGKILL — this is an abort path.
-                try:
-                    os.kill(child_pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                proc.kill()
-                proc.wait()
-                os.close(block_w)
+                idx = cmd.index(_RESOLV_FD_PLACEHOLDER)
+            except ValueError as e:
                 raise ExecutionError(
-                    f'setup-script[{script_failure.index}] exited with {script_failure.returncode}; sandbox aborted'
-                ) from script_failure
-            # Normal path: release bwrap.
-            try:
-                os.write(block_w, b'\n')
-            finally:
-                os.close(block_w)
-            return proc.wait()
-        finally:
-            _reap_pids(setup_daemons)
-    except FileNotFoundError:
-        raise ExecutionError('bwrap not found in PATH') from None
+                    'nameserver set but resolv-fd placeholder missing from cmd '
+                    '(build_bwrap_command and execute_bwrap are out of sync)'
+                ) from e
+            cmd = [*cmd[:idx], str(ns_fd), *cmd[idx + 1 :]]
+        if not debug and not scripts:
+            pass_fds = [ns_fd] if ns_fd >= 0 else ()
+            return subprocess.run(cmd, pass_fds=pass_fds).returncode
+        return _run_with_blockfd(cmd, debug, scripts, extra_unshare_net, ns_fd)
+    except FileNotFoundError as e:
+        # Can come from bwrap/unshare itself (the fast path or Popen)
+        # or from `bash` inside _run_setup_scripts. `e.filename` is set
+        # by subprocess for ENOENT exec failures — preserve it so the
+        # message names the actual missing binary.
+        missing = e.filename or 'bwrap'
+        raise ExecutionError(f'{missing}: command not found') from None
     except ExecutionError:
         raise
     except Exception as e:
         raise ExecutionError(f'Failed to execute bwrap: {e}') from e
     finally:
-        # NamedTemporaryFile(delete=True) auto-unlinks on close. We just
-        # need to close — even if bwrap setup errored out earlier, this
-        # block still runs.
-        for f in files_to_close:
-            try:
-                f.close()
-            except Exception as e:
-                logger.debug(f'temp file close failed for {getattr(f, "name", "?")}: {e}')
+        if ns_fd >= 0:
+            with contextlib.suppress(OSError):
+                os.close(ns_fd)
+
+
+def _run_with_blockfd(
+    cmd: list[str],
+    debug: bool,
+    scripts: list[str],
+    extra_unshare_net: bool,
+    ns_fd: int = -1,
+) -> int:
+    """Spawn bwrap with --info-fd / --block-fd pipes and orchestrate
+    setup-scripts in the gap between bwrap setup and payload exec.
+
+    Cleanup contract for the live-bwrap window (Popen → release/kill):
+      - `except BaseException`: SIGKILL bwrap (sandbox-init first) so
+        closing block_w can't release the payload on any error path —
+        whether a setup-script aborts, an ioctl fails, or the user
+        sends KeyboardInterrupt.
+      - `finally`: drop any fds the success path didn't already drop
+        (bwrap_user_fd, block_w on the abort path) and reap any
+        setup-script daemons that reparented to us.
+
+    The --info-fd / --block-fd args go right after `bwrap`, not after
+    cmd[0] — when extra-unshare-net is on, cmd[0] is `unshare` and
+    these flags belong on bwrap, not on the wrapper.
+    """
+    # `-1` sentinels so the cleanup loop below knows which fds actually
+    # got allocated: the second `os.pipe()` can raise EMFILE, leaving the
+    # first pair allocated; `Popen` can raise FileNotFoundError after
+    # both pairs are allocated. In either case we must close everything
+    # we own, since Popen never takes ownership of pass_fds on failure.
+    info_r = info_w = block_r = block_w = -1
+    try:
+        info_r, info_w = os.pipe()
+        block_r, block_w = os.pipe()
+        cmd_with_fds = _inject_after_bwrap(cmd, ['--info-fd', str(info_w), '--block-fd', str(block_r)])
+        pass_fds = [info_w, block_r] + ([ns_fd] if ns_fd >= 0 else [])
+        proc = subprocess.Popen(cmd_with_fds, pass_fds=pass_fds)
+    except BaseException:
+        for fd in (info_r, info_w, block_r, block_w):
+            if fd >= 0:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+        raise
+    # Popen succeeded; bwrap holds its own copies of info_w/block_r.
+    os.close(info_w)
+    os.close(block_r)
+
+    # bwrap is live and paused on block_fd from here on.
+    child_pid: int | None = None
+    bwrap_user_fd: int | None = None
+    setup_daemons: set[int] = set()
+    released = False
+    try:
+        try:
+            parsed = _read_bwrap_info(info_r)
+        finally:
+            os.close(info_r)
+        if debug:
+            logger.debug('bwrap --info-fd:\n' + json.dumps(parsed, indent=2))
+        raw_pid = parsed.get('child-pid')
+        if not isinstance(raw_pid, int) or raw_pid <= 0:
+            raise ExecutionError(f"bwrap info-fd: missing/invalid 'child-pid' (got {raw_pid!r})")
+        child_pid = raw_pid
+
+        # BWRAP_NETNS, EXTRA_*: handed out as procfs paths directly (they
+        # have live processes in them, so /proc/<pid>/ns/* works from any
+        # userns). BWRAP_USERNS is the odd one — no process lives in
+        # that intermediate userns, so we open it via NS_GET_USERNS and
+        # expose the resulting fd through /proc/<bww>/fd/<N>.
+        bwrap_user_fd = _open_bwrap_userns_fd(child_pid)
+        if debug:
+            _log_ns_readlinks(
+                unshare_pid=proc.pid,
+                child_pid=child_pid,
+                bwrap_user_fd=bwrap_user_fd,
+                extra_unshare_net=extra_unshare_net,
+            )
+
+        # _run_setup_scripts may raise SetupScriptFailed — let it
+        # propagate to the outer except, which kills bwrap before
+        # block_w closes (otherwise sandbox-init would EOF and exec
+        # the payload). The finally snapshots daemons spawned by any
+        # already-completed scripts (subprocess.run has returned for
+        # each, so their bash is dead and daemons reparented to us).
+        try:
+            _run_setup_scripts(
+                child_pid,
+                scripts,
+                unshare_pid=proc.pid,
+                bwrap_user_fd=bwrap_user_fd,
+                extra_unshare_net=extra_unshare_net,
+            )
+        except SetupScriptFailed as e:
+            logger.error(str(e))
+            raise ExecutionError(f'setup-script[{e.index}] exited with {e.returncode}; sandbox aborted') from e
+        finally:
+            setup_daemons = _snapshot_setup_descendants(exclude_pid=proc.pid)
+
+        # Normal release path: write block_w to let sandbox-init exec
+        # the payload, then wait for the full bwrap tree to exit.
+        os.write(block_w, b'\n')
+        os.close(block_w)
+        released = True
+        return proc.wait()
+    except BaseException:
+        _kill_bwrap_tree(proc, child_pid)
+        raise
+    finally:
+        if bwrap_user_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(bwrap_user_fd)
+        if not released:
+            with contextlib.suppress(OSError):
+                os.close(block_w)
+        _reap_pids(setup_daemons)

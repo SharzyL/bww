@@ -60,13 +60,6 @@ def create_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
-        '--debug-tmpfs',
-        action='store_true',
-        dest='debug_tmpfs',
-        help='Show tmpfs content after exit',
-    )
-
-    parser.add_argument(
         '--validate',
         action='store_true',
         help='Validate configuration and exit',
@@ -141,11 +134,10 @@ def main() -> None:
 
         exit_code = execute_bwrap(
             to_argv(bwrap_groups),
-            args.debug_tmpfs,
             debug=bool(args.debug),
             setup_script=runtime.setup_script,
             extra_unshare_net=runtime.extra_unshare_net,
-            temp_files=runtime.temp_files,
+            nameserver=runtime.nameserver,
         )
         sys.exit(exit_code)
 
