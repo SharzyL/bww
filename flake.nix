@@ -40,7 +40,9 @@
 
       shellOverride = pkgs: oldAttrs: {
         name = "${name}-dev-shell";
-        version = null;
+        # Keep the inherited `version` (a string): newer nixpkgs
+        # mk-python-derivation evaluates `lib.hasInfix "unstable-"
+        # version` for pyproject packages, which chokes on `null`.
         src = null;
         nativeBuildInputs = (oldAttrs.nativeBuildInputs or [ ]) ++ (with pkgs; [
           uv
@@ -70,7 +72,13 @@
       kdlpyRev = "d9a220762fb9f55e4f59296256221084c26f54da";
       pythonOverrides = pyFinal: pyPrev: {
         kdl-py = pyPrev.kdl-py.overrideAttrs (old: {
-          version = "main-${builtins.substring 0 7 kdlpyRev}";
+          # A git snapshot: base 1.2.0 (what upstream's METADATA still
+          # declares) plus the rev as a PEP 440 local-version segment.
+          version = "1.2.0+unstable.${builtins.substring 0 7 kdlpyRev}";
+          # ...which no longer equals the METADATA's bare '1.2.0', so the
+          # metadata-version check would fail. Skip it — the rev in the
+          # store path is the useful signal here, not METADATA parity.
+          dontCheckPythonMetadata = true;
           src = pyPrev.pkgs.fetchFromGitHub {
             owner = "tabatkins";
             repo = "kdlpy";
